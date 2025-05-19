@@ -1331,10 +1331,10 @@ def normalize_hbi_attribute_filter(attribute_filter):
 
 
 def normalize_operation_in_attribute_filter(attribute_filter):
-    """Set Attribute Filter invalid 'operation' to valid operation if value type is 'str' or 'list'."""
+    """Set Attribute Filter invalid 'operation' to valid operation if value type is 'str', 'int' or 'list'."""
     op = attribute_filter.get("operation")
     value = attribute_filter.get("value")
-    if op != "equal" and isinstance(value, str) or isinstance(value, int):
+    if op != "equal" and isinstance(value, (str, int)):
         attribute_filter["operation"] = "equal"
     elif op != "in" and isinstance(value, list):
         attribute_filter["operation"] = "in"
