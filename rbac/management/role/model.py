@@ -18,12 +18,13 @@
 """Model for role management."""
 
 import logging
-from typing import Optional, Union
+from typing import Optional, TYPE_CHECKING, Union
 from uuid import uuid4
 
 from django.conf import settings
+from django.contrib.postgres.fields import ArrayField
 from django.db import models
-from django.db.models import signals
+from django.db.models import BooleanField, IntegerField, OneToOneField, signals
 from django.utils import timezone
 from internal.integration import sync_handlers
 from management.cache import AccessCache, skip_purging_cache_for_public_tenant
@@ -41,6 +42,9 @@ from migration_tool.models import (
 
 from api.models import FilterQuerySet, TenantAwareModel
 
+if TYPE_CHECKING:
+    from management.role.v2_model import RoleV2
+
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
 
@@ -57,6 +61,7 @@ class Role(TenantAwareModel):
     created = models.DateTimeField(default=timezone.now)
     modified = AutoDateTimeField(default=timezone.now)
     admin_default = models.BooleanField(default=False)
+
     objects = FilterQuerySet.as_manager()
 
     @property
@@ -131,14 +136,14 @@ class ResourceDefinition(TenantAwareModel):
 class ExtTenant(models.Model):
     """External tenant."""
 
-    name = models.CharField(max_length=20, null=False, unique=True)
+    name = models.CharField(max_length=64, null=False, unique=True)
 
 
 class ExtRoleRelation(models.Model):
     """External relation info of role."""
 
     ext_tenant = models.ForeignKey(ExtTenant, null=True, on_delete=models.CASCADE, related_name="ext_role_relation")
-    ext_id = models.CharField(max_length=20, null=False)
+    ext_id = models.CharField(max_length=64, null=False)
     role = models.OneToOneField(Role, on_delete=models.CASCADE, null=False, related_name="ext_relation")
 
     class Meta:
@@ -153,9 +158,30 @@ class BindingMapping(models.Model):
     # JSON encoding of migration_tool.models.V2rolebinding
     mappings = models.JSONField(default=dict)
     role = models.ForeignKey(Role, on_delete=models.CASCADE, related_name="binding_mappings")
+    v2_role = models.ForeignKey(
+        "management.RoleV2",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="binding_mappings",
+    )
     resource_type_namespace = models.CharField(max_length=256, null=False)
     resource_type_name = models.CharField(max_length=256, null=False)
     resource_id = models.CharField(max_length=256, null=False)
+
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=["role", "resource_type_namespace", "resource_type_name", "resource_id"],
+                name="bm_role_resource_idx",
+            ),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["v2_role", "resource_type_namespace", "resource_type_name", "resource_id"],
+                name="unique_bindingmapping_v2role_resource",
+            ),
+        ]
 
     def save(self, *args, **kwargs):
         """Validate and save this BindingMapping."""
@@ -167,7 +193,7 @@ class BindingMapping(models.Model):
         super().save(*args, **kwargs)
 
     @classmethod
-    def for_role_binding(cls, role_binding: V2rolebinding, v1_role: Union[Role, str]):
+    def for_role_binding(cls, role_binding: V2rolebinding, v1_role: Union[Role, str], v2_role: Optional["RoleV2"]):
         """Create a new BindingMapping for a V2rolebinding."""
         mappings = role_binding.as_minimal_dict()
         resource = role_binding.resource
@@ -180,6 +206,7 @@ class BindingMapping(models.Model):
         return cls(
             mappings=mappings,
             **role_arg,
+            v2_role=v2_role,
             resource_type_namespace=resource_type_namespace,
             resource_type_name=resource_type_name,
             resource_id=resource_id,
@@ -301,6 +328,23 @@ class BindingMapping(models.Model):
             raise TypeError(f"Expected SourceKey, but got: {source!r}")
 
         return source
+
+
+class RoleScopeState(models.Model):
+    """
+    Data concerning a system role's scopes.
+
+    version and computed_scopes are to be updated during seeding to reflect the scopes computed at that time.
+    migrated should be set to False on any change and only updated to True when any bindings to previous scopes have
+    been successfully migrated to the new scopes.
+
+    This should only be updated in a SERIALIZABLE transaction for synchronization reasons.
+    """
+
+    role = OneToOneField(Role, on_delete=models.CASCADE, related_name="scope_state", null=False)
+    version = IntegerField(default=0)
+    computed_scopes = ArrayField(models.IntegerField(), null=False)
+    migrated = BooleanField(default=False)
 
 
 def role_related_obj_change_cache_handler(sender=None, instance=None, using=None, **kwargs):

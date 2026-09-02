@@ -26,6 +26,8 @@ from django.conf import settings
 from django.contrib.staticfiles.urls import staticfiles_urlpatterns
 from django.urls import include, path, re_path
 
+from api.status.view import root
+
 API_PATH_PREFIX = os.getenv("API_PATH_PREFIX", "api/")
 if API_PATH_PREFIX != "":
     if API_PATH_PREFIX.startswith("/"):
@@ -38,10 +40,14 @@ if API_PATH_PREFIX != "":
 urlpatterns = [
     re_path(r"^{}v1/".format(API_PATH_PREFIX), include(("api.urls", "v1_api"))),
     re_path(r"^{}v1/".format(API_PATH_PREFIX), include(("management.urls", "v1_management"))),
-    path(settings.A2S_PATH_PREFIX.lstrip("/"), include(("management.mcp_urls", "mcp"))),
     path("_private/", include(("internal.urls", "internal"))),
+    path("", root, name="root"),
     path("", include("django_prometheus.urls")),
 ]
+
+if settings.MCP_ENABLED:
+    urlpatterns.insert(2, path(settings.A2S_PATH_PREFIX.lstrip("/"), include(("management.mcp_urls", "mcp"))))
+
 
 if settings.V2_APIS_ENABLED:
     urlpatterns.extend(

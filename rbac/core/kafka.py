@@ -49,13 +49,21 @@ class RBACProducer:
                 while retries <= max_retries:
                     try:
                         if settings.KAFKA_AUTH:
-                            self.producer = KafkaProducer(**settings.KAFKA_AUTH)
+                            self.producer = KafkaProducer(
+                                **settings.KAFKA_AUTH,
+                                enable_idempotence=True,  # Deduplicate producer retries (v3 default)
+                                acks="all",  # Wait for all in-sync replicas (v3 default)
+                            )
                             logger.info("Kafka producer initialized successfully")
                             return self.producer
                         elif not settings.KAFKA_SERVERS:
                             raise AttributeError("Empty servers list")
                         else:
-                            self.producer = KafkaProducer(bootstrap_servers=settings.KAFKA_SERVERS)
+                            self.producer = KafkaProducer(
+                                bootstrap_servers=settings.KAFKA_SERVERS,
+                                enable_idempotence=True,  # Deduplicate producer retries (v3 default)
+                                acks="all",  # Wait for all in-sync replicas (v3 default)
+                            )
                             return self.producer
                     except KafkaError as e:
                         logger.error(f"Kafka error during initialization of Kafka producer: {e}")
@@ -65,13 +73,25 @@ class RBACProducer:
                         retries += 1
         return self.producer
 
-    def send_kafka_message(self, topic, message, headers=None):
-        """Send message to kafka server."""
-        producer = self.get_producer()
-        json_data = json.dumps(message).encode("utf-8")
-        if headers and not isinstance(headers, list):
-            headers = [headers]
-        producer.send(topic, value=json_data, headers=headers)
+    def send_kafka_message(self, topic, message, headers=None) -> bool:
+        """Send message to kafka server.
+
+        Returns True if sent successfully, False if an error occurred (error is logged).
+        """
+        try:
+            producer = self.get_producer()
+            json_data = json.dumps(message).encode("utf-8")
+            if headers and not isinstance(headers, list):
+                headers = [headers]
+            producer.send(topic, value=json_data, headers=headers)
+            return True
+        except (KafkaError, TypeError, ValueError, AttributeError):
+            logger.exception(
+                "Failed to send Kafka message to topic '%s'. Message type: %s",
+                topic,
+                list(message.keys()) if isinstance(message, dict) else type(message).__name__,
+            )
+            return False
 
 
 """

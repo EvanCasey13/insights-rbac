@@ -17,10 +17,162 @@
 
 """Serializer for workspace management."""
 
+import re
+import uuid
+from collections.abc import Mapping
+
 from management.workspace.service import WorkspaceService
 from rest_framework import serializers
 
 from .model import Workspace
+
+WORKSPACE_NAME_REGEX = re.compile(r"^[\w\s-]+$")
+
+_ALL_TYPE = "all"
+_VALID_TYPES = [v.lower() for v in Workspace.Types.values] + [_ALL_TYPE]
+
+
+class _WorkspaceFilterValidationMixin:
+    """Shared validation logic for workspace list and query input serializers.
+
+    Centralizes type/name/NUL-byte validation so that
+    WorkspaceListInputSerializer and WorkspaceQueryInputSerializer
+    stay in sync without duplicating code.
+    """
+
+    def to_internal_value(self, data):
+        """Reject NUL bytes in string fields.
+
+        Guards with a Mapping check so non-object bodies (e.g. a list or
+        string) fall through to DRF's standard validation and return a
+        proper 400 instead of an ``AttributeError``.
+        """
+        if isinstance(data, Mapping):
+            for key, value in data.items():
+                if isinstance(value, str) and "\x00" in value:
+                    raise serializers.ValidationError({key: f"The '{key}' field contains invalid characters."})
+        return super().to_internal_value(data)
+
+    def validate_type(self, value: str | None) -> list[str] | None:
+        """Normalize empty to None, split comma-separated values, validate against allowed types."""
+        if not value or not value.strip():
+            return None
+        fields = [v.strip().lower() for v in value.split(",") if v.strip()]
+        if not fields:
+            return None
+        for val in fields:
+            if val not in _VALID_TYPES:
+                raise serializers.ValidationError(
+                    f"type query parameter value '{val}' is invalid. "
+                    f"Allowed values are {[str(v) for v in _VALID_TYPES]}."
+                )
+        if _ALL_TYPE in fields:
+            return None
+        return fields
+
+    def validate_name(self, value: str | None) -> str | None:
+        """Return None for empty values, strip surrounding whitespace."""
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        return cleaned
+
+
+class WorkspaceListInputSerializer(_WorkspaceFilterValidationMixin, serializers.Serializer):
+    """Input serializer for workspace list query parameters.
+
+    GET /v2/workspaces/
+    """
+
+    type = serializers.CharField(required=False, allow_blank=True, help_text="Filter by workspace type")
+    name = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text=(
+            "Filter by workspace name. Case-insensitive substring match by default;"
+            " use * for glob patterns (e.g. foo*)."
+        ),
+    )
+    parent_id = serializers.CharField(required=False, allow_blank=True, help_text="Filter by parent workspace ID")
+    ids = serializers.CharField(required=False, allow_blank=True, help_text="Filter by comma-separated workspace IDs")
+    with_ancestry = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="Include ancestor and fallback workspaces (root, default, ungrouped) in the response.",
+    )
+
+    def validate_parent_id(self, value: str | None) -> str | None:
+        """Return None for empty values, validate UUID format otherwise."""
+        if not value:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        try:
+            uuid.UUID(cleaned)
+        except ValueError as e:
+            raise serializers.ValidationError(f"{cleaned} is not a valid UUID.") from e
+        return cleaned
+
+    def validate_ids(self, value: str | None) -> list[str] | None:
+        """Return None for empty values, split and validate UUIDs otherwise."""
+        if not value or not value.strip():
+            return None
+        ids = list(dict.fromkeys(stripped for id_val in value.split(",") if (stripped := id_val.strip().lower())))
+        for workspace_id in ids:
+            try:
+                uuid.UUID(workspace_id)
+            except ValueError as e:
+                raise serializers.ValidationError(f"{workspace_id} is not a valid UUID.") from e
+        return ids
+
+
+class WorkspaceQueryInputSerializer(_WorkspaceFilterValidationMixin, serializers.Serializer):
+    """Input serializer for workspace query via POST body.
+
+    POST /v2/workspaces/query/
+
+    Allows filtering by a list of workspace IDs in the request body,
+    avoiding URL length limits when querying many workspaces at once.
+    """
+
+    ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=True,
+        allow_empty=False,
+        max_length=3000,
+        help_text="List of workspace UUIDs to filter by.",
+    )
+    type = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=200,
+        help_text="Filter by workspace type",
+    )
+    name = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text=(
+            "Filter by workspace name. Case-insensitive substring match by default;"
+            " use * for glob patterns (e.g. foo*)."
+        ),
+    )
+    parent_id = serializers.UUIDField(required=False, help_text="Filter by parent workspace ID")
+    with_ancestry = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="Include ancestor and fallback workspaces (root, default, ungrouped) in the response.",
+    )
+
+    def validate_ids(self, value: list) -> list[str]:
+        """Convert UUIDs to lowercase strings and deduplicate."""
+        return list(dict.fromkeys(str(uid).lower() for uid in value))
+
+    def validate_parent_id(self, value) -> str | None:
+        """Convert UUID to string."""
+        return str(value) if value else None
 
 
 class WorkspaceSerializer(serializers.ModelSerializer):
@@ -51,6 +203,19 @@ class WorkspaceSerializer(serializers.ModelSerializer):
     @property
     def _service(self) -> WorkspaceService:
         return self.context["view"]._service
+
+    def validate_name(self, value):
+        """Reject names with characters other than letters, numbers, spaces, hyphens, and underscores.
+
+        Existing names are grandfathered: skip validation when the name is unchanged on update.
+        """
+        if self.instance and self.instance.name == value:
+            return value
+        if not WORKSPACE_NAME_REGEX.match(value):
+            raise serializers.ValidationError(
+                "Workspace name may only contain letters, numbers, spaces, hyphens, and underscores."
+            )
+        return value
 
     def validate(self, attrs):
         """Require parent_id in the body for PUT (full update) requests."""

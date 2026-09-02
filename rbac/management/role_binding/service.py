@@ -28,7 +28,14 @@ from management.atomic_transactions import atomic
 from management.exceptions import InvalidFieldError, NotFoundError, RequiredFieldError
 from management.group.model import Group
 from management.group.platform import DefaultGroupNotAvailableError, GlobalPolicyIdService
-from management.permission.scope_service import Scope
+from management.permission.scope_service import (
+    SCOPE_DISPLAY_NAME,
+    Scope,
+    default_implicit_resource_service,
+    permission_scope_cache,
+    resolve_workspace_scope,
+    scope_for_resource,
+)
 from management.principal.model import Principal
 from management.relation_replicator.noop_replicator import NoopReplicator
 from management.relation_replicator.outbox_replicator import OutboxReplicator
@@ -69,6 +76,7 @@ class UpdateRoleBindingResult:
     resource_type: str
     subject: Group | Principal
     resource_name: Optional[str] = None
+    custom_default_group_created: Optional[Group] = None
 
 
 logger = logging.getLogger(__name__)
@@ -97,11 +105,13 @@ class RoleBindingService:
         replicator: RelationReplicator | None = None,
         principal_source: str = API_PRINCIPAL_SOURCE,
         allow_external_subjects: bool = False,
+        skip_scope_validation: bool = False,
     ):
         """Initialize the service with a tenant and optional replicator."""
         self.tenant = tenant
         self._principal_source = principal_source
         self._allow_external_subjects = allow_external_subjects
+        self._skip_scope_validation = skip_scope_validation
 
         if settings.REPLICATION_TO_RELATION_ENABLED:
             self._replicator = replicator if replicator is not None else OutboxReplicator()
@@ -202,8 +212,11 @@ class RoleBindingService:
 
         # Handle edge case: exclude_direct but no inherited bindings available
         if exclude_direct and binding_uuids is None:
-            # Relations API failed or not configured — cannot determine inherited bindings
-            return RoleBinding.objects.for_tenant(self.tenant).none()
+            # Relations API failed or not configured — cannot determine inherited bindings.
+            # We still call .with_expanded_platform_roles() before .none() because
+            # CursorPagination validates ordering fields via .order_by() even on empty
+            # querysets, so the ``effective_role_created`` annotation must exist.
+            return RoleBinding.objects.for_tenant(self.tenant).with_expanded_platform_roles().none()
 
         queryset = RoleBinding.objects.for_tenant(self.tenant)
 
@@ -235,6 +248,10 @@ class RoleBindingService:
                 resource_type=resource_type,
                 resource_id=str(resource_id) if resource_id else None,
             )
+
+        # Expand platform-role bindings into per-child-role rows at the DB level
+        # so that pagination (limit/offset) operates on the expanded count.
+        queryset = queryset.with_expanded_platform_roles()
 
         return queryset
 
@@ -296,6 +313,9 @@ class RoleBindingService:
 
         for resource_type, resource_id in {(r.resource_type, r.resource_id) for r in requests}:
             self._validate_resource(resource_type, resource_id)
+
+        for req in requests:
+            self._validate_role_scopes([roles_by_uuid[req.role_id]], req.resource_type, req.resource_id)
 
         access_groups = self._group_by_subject_resource(requests, roles_by_uuid)
         all_tuples_to_add: list[RelationTuple] = []
@@ -934,7 +954,7 @@ class RoleBindingService:
         except Exception as e:
             logger.error(f"Failed to restore default bindings for tenant {self.tenant.org_id}: {e}")
 
-    def _maybe_customize_default_group(self, subject: Subject) -> Subject:
+    def _maybe_customize_default_group(self, subject: Subject) -> tuple[Subject, Optional[Group]]:
         """If subject is the public tenant's default access group, customize it for this tenant.
 
         When modifying role bindings for the public tenant's system default access group,
@@ -944,9 +964,13 @@ class RoleBindingService:
         If the tenant already has a custom default group, returns that instead.
 
         Returns the original subject unchanged when it is not the public default group.
+
+        Returns:
+            A tuple of (subject, created_group). created_group is the newly created custom
+            default group if one was created, or None otherwise.
         """
         if not subject.is_group:
-            return subject
+            return subject, None
         group = subject.entity
         if group.admin_default:
             raise InvalidFieldError(
@@ -954,11 +978,11 @@ class RoleBindingService:
                 "Role bindings for the admin default group cannot be modified.",
             )
         if not (group.platform_default and group.system):
-            return subject
+            return subject, None
 
         existing_custom = Group.objects.filter(platform_default=True, tenant=self.tenant).first()
         if existing_custom is not None:
-            return Subject(type=SubjectType.GROUP, entity=existing_custom)
+            return Subject(type=SubjectType.GROUP, entity=existing_custom), None
 
         from management.group.definer import clone_default_group_in_public_schema
 
@@ -966,7 +990,7 @@ class RoleBindingService:
         if custom_group is None:
             raise RuntimeError(f"Failed to create custom default access group for tenant {self.tenant.org_id}")
 
-        return Subject(type=SubjectType.GROUP, entity=custom_group)
+        return Subject(type=SubjectType.GROUP, entity=custom_group), custom_group
 
     @atomic
     def update_role_bindings_for_subject(
@@ -1005,10 +1029,11 @@ class RoleBindingService:
         ensure_v2_write_activated(self.tenant)
 
         roles = self._get_roles(role_ids)
+        self._validate_role_scopes(roles, resource_type, resource_id)
 
         subject = Subject.objects.by_type(type=subject_type, id=subject_id)
 
-        subject = self._maybe_customize_default_group(subject)
+        subject, created_custom_group = self._maybe_customize_default_group(subject)
 
         self._validate_subject(subject.entity)
 
@@ -1026,6 +1051,7 @@ class RoleBindingService:
             resource_type=resource_type,
             subject=subject.entity,
             resource_name=self.get_resource_name(resource_id, resource_type),
+            custom_default_group_created=created_custom_group,
         )
 
         logger.info(
@@ -1095,6 +1121,66 @@ class RoleBindingService:
             raise InvalidFieldError("roles", f"The following roles do not exist: {', '.join(missing)}")
 
         return roles
+
+    def _validate_role_scopes(self, roles: list[RoleV2], resource_type: str, resource_id: str) -> None:
+        """Validate that each role's highest scope matches the target resource.
+
+        Uses ``ImplicitResourceService.highest_scope_for_permissions`` to compute
+        the scope from each role's permission strings.
+
+        For standard (child) workspaces, additionally rejects roles that have
+        any explicit-DEFAULT permissions or no permissions at all, since those
+        represent grants no service checks at that workspace level.
+
+        Must be called after ``_validate_resource`` which ensures the resource
+        exists. Empty *roles* is valid (means "unbind all") and skips the check.
+
+        Raises:
+            InvalidFieldError: If any role's scope does not match the resource.
+            NotFoundError: If the resource cannot be resolved to a scope (should
+                not happen when ``_validate_resource`` ran first).
+        """
+        if self._skip_scope_validation or not roles:
+            return
+
+        is_standard_workspace = False
+        expected: Scope
+        if resource_type == "workspace":
+            result = resolve_workspace_scope(resource_id, self.tenant)
+            if result is None:
+                raise NotFoundError(resource_type, resource_id)
+            expected, is_standard_workspace = result
+        else:
+            resolved = scope_for_resource(resource_type, resource_id, self.tenant)
+            if resolved is None:
+                if resource_type == "tenant":
+                    raise NotFoundError(resource_type, resource_id)
+                return
+            expected = resolved
+
+        explicit_default_ids = permission_scope_cache.explicit_default_ids if is_standard_workspace else frozenset()
+
+        mismatched: list[str] = []
+        for role in roles:
+            perm_rows = list(role.permissions.values_list("id", "permission"))
+            perm_strings = [row[1] for row in perm_rows]
+            role_scope = default_implicit_resource_service.highest_scope_for_permissions(perm_strings)
+            if role_scope != expected:
+                mismatched.append(f"{role.name} ({role.uuid})")
+            elif is_standard_workspace:
+                if not perm_rows:
+                    mismatched.append(f"{role.name} ({role.uuid})")
+                elif explicit_default_ids:
+                    perm_ids = {row[0] for row in perm_rows}
+                    if perm_ids & explicit_default_ids:
+                        mismatched.append(f"{role.name} ({role.uuid})")
+
+        if mismatched:
+            scope_label = "Standard Workspace" if is_standard_workspace else SCOPE_DISPLAY_NAME[expected]
+            raise InvalidFieldError(
+                "roles",
+                f"The following roles are not scoped for this resource ({scope_label}): {', '.join(mismatched)}",
+            )
 
     def _replace_role_bindings(
         self,

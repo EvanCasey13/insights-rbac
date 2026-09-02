@@ -18,13 +18,17 @@
 """Role binding access permissions using Kessel Inventory API."""
 
 import logging
+import uuid
 
+from django.conf import settings
 from feature_flags import FEATURE_FLAGS
 from management.permissions.workspace_inventory_access import (
     WorkspaceInventoryAccessChecker,
 )
 from management.principal.proxy import get_kessel_principal_id
+from management.workspace.model import Workspace
 from rest_framework import permissions
+from rest_framework.exceptions import NotFound, ParseError
 
 from api.models import Tenant
 
@@ -70,6 +74,19 @@ class RoleBindingSystemUserAccessPermission(permissions.BasePermission):
 
         # System users without admin are denied
         if _is_system_user_without_admin(user):
+            # Authorization failure - SEC-MON-REQ-1 compliance (EOI-8 authorization_failure, EOI-4 access_manipulation)
+            logger.warning(
+                "Authorization denied",
+                extra={
+                    "action": request.method,
+                    "resource_type": "role_binding",
+                    "outcome": "failure",
+                    "org_id": getattr(request.user, "org_id", None),
+                    "username": getattr(request.user, "username", None),
+                    "reason": "system_user_without_admin",
+                    "endpoint": request.path,
+                },
+            )
             return False
 
         # All other users pass through to next permission class (Kessel check)
@@ -155,13 +172,35 @@ class RoleBindingKesselAccessPermission(permissions.BasePermission):
     def _check_read_permission(self, request):
         """Check read permission using resource info from query params.
 
-        Returns True if no resource params provided (pass-through for list endpoint).
+        When resource params are provided, checks access on that specific resource.
+        When no resource params are provided, falls back to a tenant-level check
+        which requires org admin access.
         """
         resource_type, resource_id = self._parse_query_resource(request)
         if not resource_type:
-            return True
+            return self._check_tenant_read_permission(request)
 
         return self._check_single_resource(request, resource_type, resource_id, self._get_read_relation())
+
+    def _check_tenant_read_permission(self, request):
+        """Check read permission at tenant level when no resource params provided.
+
+        When a read request (list, by_subject, etc.) omits resource_id/resource_type
+        query parameters, this method falls back to a tenant-level permission check.
+        When KESSEL_TENANT_AUTH_ENABLED is off, only org admins are allowed.
+        When on, the check is delegated to Kessel.
+        """
+        tenant = getattr(request, "tenant", None)
+        if tenant is None:
+            logger.debug("Denied unscoped role binding read: no tenant on request")
+            return False
+
+        tenant_resource_id = tenant.tenant_resource_id()
+        if not tenant_resource_id:
+            logger.debug("Denied unscoped role binding read: tenant has no resource ID")
+            return False
+
+        return self._check_single_resource(request, "tenant", tenant_resource_id, self._get_read_relation())
 
     def _check_batch_create_permission(self, request):
         """Check write permission for batch create.
@@ -221,11 +260,41 @@ class RoleBindingKesselAccessPermission(permissions.BasePermission):
             return self._check_single_resource(request, resource_type, resource_id, self.EDIT_RELATION)
 
     def _resolve_principal_id(self, request, unique_resources):
-        """Resolve principal_id once if any non-tenant resources need Kessel checks."""
+        """Resolve principal_id once if any resources need Kessel checks."""
+        if settings.KESSEL_TENANT_AUTH_ENABLED:
+            return get_kessel_principal_id(request)
         needs_kessel = any(rt != "tenant" for rt, _ in unique_resources)
         if needs_kessel:
             return get_kessel_principal_id(request)
         return None
+
+    def _validate_workspace_exists(self, request, resource_id):
+        """Validate that a workspace exists in the request's tenant.
+
+        Raises NotFound if the workspace does not exist for the tenant.
+        Silently returns if the resource_id is not a valid UUID (handled elsewhere).
+        """
+        tenant = getattr(request, "tenant", None)
+        if tenant is None:
+            return
+
+        try:
+            validated_uuid = uuid.UUID(str(resource_id))
+        except (ValueError, AttributeError):
+            # Not a valid UUID — skip existence check; Kessel will handle the error
+            return
+
+        try:
+            exists = Workspace.objects.filter(id=validated_uuid, tenant=tenant).exists()
+        except TypeError:
+            logger.exception(
+                "Error checking workspace existence for resource_id %s",
+                resource_id,
+            )
+            return
+
+        if not exists:
+            raise NotFound(detail=f"Workspace with id '{resource_id}' not found.")
 
     def _check_single_resource(self, request, resource_type, resource_id, relation, principal_id=None) -> bool:
         """Check access on a single resource via Kessel or org-admin check.
@@ -236,14 +305,19 @@ class RoleBindingKesselAccessPermission(permissions.BasePermission):
                          don't pre-resolve).
         """
         if resource_type not in self.ALLOWED_RESOURCE_TYPES:
-            logger.debug("Denied access for unknown resource_type: %s", resource_type)
-            return False
+            allowed = ", ".join(sorted(self.ALLOWED_RESOURCE_TYPES))
+            raise ParseError(f"'{resource_type}' is not a valid resource_type. Allowed values: {allowed}.")
+
+        if resource_type == "workspace":
+            try:
+                uuid.UUID(str(resource_id))
+            except ValueError:
+                raise ParseError(detail=f"'{resource_id}' is not a valid UUID for resource_id.")
+
+        if resource_type == "workspace":
+            self._validate_workspace_exists(request, resource_id)
 
         if resource_type == "tenant":
-            is_org_admin = getattr(request.user, "admin", False)
-            if not is_org_admin:
-                logger.debug("Denied access for tenant resource: only org admins allowed")
-                return False
             tenant = getattr(request, "tenant", None)
             if tenant is None:
                 logger.debug("Denied access for tenant resource: no tenant on request")
@@ -256,7 +330,24 @@ class RoleBindingKesselAccessPermission(permissions.BasePermission):
                     expected_resource_id,
                 )
                 return False
-            return True
+
+            if not settings.KESSEL_TENANT_AUTH_ENABLED:
+                is_org_admin = getattr(request.user, "admin", False)
+                if not is_org_admin:
+                    logger.warning(
+                        "Authorization denied",
+                        extra={
+                            "action": request.method,
+                            "resource_type": "role_binding",
+                            "outcome": "failure",
+                            "org_id": getattr(request.user, "org_id", None),
+                            "username": getattr(request.user, "username", None),
+                            "reason": "not_org_admin_for_tenant_resource",
+                            "endpoint": request.path,
+                        },
+                    )
+                    return False
+                return True
 
         if principal_id is None:
             principal_id = get_kessel_principal_id(request)
@@ -264,9 +355,27 @@ class RoleBindingKesselAccessPermission(permissions.BasePermission):
             return False
 
         checker = WorkspaceInventoryAccessChecker()
-        return checker.check_resource_access(
+        has_access = checker.check_resource_access(
             resource_type=resource_type,
             resource_id=resource_id,
             principal_id=principal_id,
             relation=relation,
         )
+        # Authorization failure - SEC-MON-REQ-1 compliance (EOI-8 authorization_failure, EOI-4 access_manipulation)
+        if not has_access:
+            logger.warning(
+                "Authorization denied",
+                extra={
+                    "action": request.method,
+                    "resource_type": "role_binding",
+                    "outcome": "failure",
+                    "org_id": getattr(request.user, "org_id", None),
+                    "username": getattr(request.user, "username", None),
+                    "reason": "kessel_permission_denied",
+                    "endpoint": request.path,
+                    "target_resource_type": resource_type,
+                    "target_resource_id": resource_id,
+                    "required_relation": relation,
+                },
+            )
+        return has_access

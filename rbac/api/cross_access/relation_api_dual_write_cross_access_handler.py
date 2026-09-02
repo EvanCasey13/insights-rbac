@@ -32,6 +32,7 @@ from management.relation_replicator.relation_replicator import (
     ReplicationEvent,
     ReplicationEventType,
     WorkspaceEvent,
+    WorkspaceEventStream,
 )
 from management.role.model import BindingMapping, Role
 from management.role.v2_model import SeededRoleV2
@@ -54,7 +55,7 @@ class _LocalReplicator(RelationReplicator):
         self._handler.relations_to_remove.extend(event.remove)
         self._handler.relations_to_add.extend(event.add)
 
-    def replicate_workspace(self, event: WorkspaceEvent):
+    def replicate_workspace(self, event: WorkspaceEvent, event_stream: WorkspaceEventStream):
         raise NotImplementedError("workspace events not unsupported")
 
 
@@ -154,10 +155,12 @@ class RelationApiDualWriteCrossAccessHandler(RelationApiDualWriteSubjectHandler)
             replicator=_LocalReplicator(self),
             principal_source=str(self._source_key()),
             allow_external_subjects=True,
+            skip_scope_validation=True,
         )
 
-    def _add_car_roles_v1(self, roles: set[Role]):
+    def _add_car_roles_v1(self, roles: Iterable[Role]):
         self._expect_v1_tenant()
+        roles = self._with_system_roles_for_share(roles)
 
         def add_principal_to_binding(mapping: BindingMapping):
             self.relations_to_add.append(mapping.assign_user_to_bindings(user_id, source_key))
@@ -166,18 +169,19 @@ class RelationApiDualWriteCrossAccessHandler(RelationApiDualWriteSubjectHandler)
         source_key = self._source_key()
 
         for role in roles:
-            self._update_mapping_for_system_role(
-                role,
-                scope=(self._resource_service.scope_for_role(role)),
-                update_mapping=add_principal_to_binding,
-                create_default_mapping_for_system_role=(
-                    lambda resource: self._create_default_mapping_for_system_role(
-                        system_role=role,
-                        resource=resource,
-                        users={str(source_key): user_id},
-                    )
-                ),
-            )
+            for scope in self._resource_service.binding_scopes_for_role(role):
+                self._update_mapping_for_system_role(
+                    role,
+                    scope=scope,
+                    update_mapping=add_principal_to_binding,
+                    create_default_mapping_for_system_role=(
+                        lambda resource: self._create_default_mapping_for_system_role(
+                            system_role=role,
+                            resource=resource,
+                            users={str(source_key): user_id},
+                        )
+                    ),
+                )
 
     @atomic
     def _add_car_roles_v2(self, roles: set[Role]):
@@ -188,8 +192,11 @@ class RelationApiDualWriteCrossAccessHandler(RelationApiDualWriteSubjectHandler)
 
         principal = Principal.objects.get(user_id=self._user_id())
 
+        # We do not need to lock the roles here, since we're in a SERIALIZABLE transaction (and so is seeding each
+        # role).
         for role in roles:
-            v1_roles_by_scope.setdefault(self._resource_service.scope_for_role(role), set()).add(role)
+            for scope in self._resource_service.binding_scopes_for_role(role):
+                v1_roles_by_scope.setdefault(scope, set()).add(role)
 
         for scope, v1_roles in v1_roles_by_scope.items():
             resource = scope_resources.resource_for(scope)
@@ -241,6 +248,8 @@ class RelationApiDualWriteCrossAccessHandler(RelationApiDualWriteSubjectHandler)
             if removal is not None:
                 self.relations_to_remove.append(removal)
 
+        # We don't need to lock the roles, since we will handle any possible scope (without actually looking at the
+        # roles).
         for role in roles:
             for scope in Scope:
                 self._update_mapping_for_system_role(
@@ -259,6 +268,8 @@ class RelationApiDualWriteCrossAccessHandler(RelationApiDualWriteSubjectHandler)
 
         v2_roles_to_remove: set[SeededRoleV2] = SeededRoleV2.for_v1_roles(roles)
 
+        # We don't need to lock the roles, since we will handle any possible scope (without actually looking at the
+        # roles).
         for scope in Scope:
             resource = scope_resources.resource_for(scope)
 

@@ -25,17 +25,21 @@ import os
 from core.utils import destructive_ok
 from django.conf import settings
 from django.db import transaction
-from django.db.models import QuerySet
+from django.db.models import F, QuerySet
 from django.utils import timezone
-from management.atomic_transactions import atomic
+from internal.migrations.migrate_role_scope import migrate_role_scope_if_changed
+from management.atomic_transactions import atomic, atomic_with_retry
 from management.group.definer import seed_group
 from management.group.platform import DefaultGroupNotAvailableError, GlobalPolicyIdService
 from management.notifications.notification_handlers import role_obj_change_notification_handler
 from management.permission.model import Permission
 from management.permission.scope_service import ImplicitResourceService, Scope
 from management.relation_replicator.relation_replicator import ReplicationEventType
-from management.role.model import Access, ExtRoleRelation, ExtTenant, ResourceDefinition, Role
-from management.role.platform import admin_platform_parent_scope_for_seeded_system_role, platform_v2_role_uuid_for
+from management.role.model import Access, ExtRoleRelation, ExtTenant, ResourceDefinition, Role, RoleScopeState
+from management.role.platform import (
+    admin_platform_parent_scopes_for_seeded_system_role,
+    platform_v2_role_uuid_for,
+)
 from management.role.relation_api_dual_write_handler import (
     RelationApiDualWriteHandler,
     SeedingRelationApiDualWriteHandler,
@@ -86,9 +90,9 @@ class _SeedRolesConfig:
 
 
 # We do each operation in a SERIALIZABLE transaction so that other SERIALIZABLE transactions can have a consistent view
-# of what system roles exist.
-@atomic
-def _make_role(data, config: _SeedRolesConfig, platform_roles=None, resource_service=None):
+# of what system roles exist. Retry on serialization failures since concurrent seeding can conflict.
+@atomic_with_retry(retries=3)
+def _make_role(data, config: _SeedRolesConfig, platform_roles=None, resource_service=None) -> Role:
     """Create the role object in the database."""
     public_tenant = Tenant.objects.get(tenant_name="public")
     name = data.get("name")
@@ -101,7 +105,20 @@ def _make_role(data, config: _SeedRolesConfig, platform_roles=None, resource_ser
         platform_default=data.get("platform_default", False),
         admin_default=data.get("admin_default", False),
     )
-    role, created = Role.objects.get_or_create(name=name, defaults=defaults, tenant=public_tenant)
+
+    # Taking a lock on the role prevents it from being assigned during seeding (since the dual-write handlers lock it
+    # FOR SHARE). Doing this ensures that, once seeding the role has finished, all further assignments will see the
+    # new permissions (and thus use them to compute the relevant scopes).
+    #
+    # This doesn't technically ensure that other processes will use the new scopes in all situations; if the scopes have
+    # changed due to a change in the *settings*, rather than the permissions, then a process with the old settings
+    # will continue using the old scope. We don't have a good way to fix that here. (The obvious ideas for how to fix
+    # it would be using scopes stored in the database during assignment and storing the latest scope settings
+    # themselves in the database. Alternatively, we could just be sure to manually migrate the relevant roles every
+    # time the settings change.)
+    #
+    # TODO: fix the above
+    role, created = Role.objects.select_for_update().get_or_create(name=name, defaults=defaults, tenant=public_tenant)
     updated = False
 
     dual_write_handler = SeedingRelationApiDualWriteHandler(role)
@@ -157,18 +174,24 @@ def _make_role(data, config: _SeedRolesConfig, platform_roles=None, resource_ser
     return role
 
 
-def _update_or_create_roles(roles, config: _SeedRolesConfig, platform_roles=None, resource_service=None):
-    """Update or create roles from list."""
-    current_role_ids = set()
-    # Sort roles by name to ensure consistent lock ordering and prevent deadlocks
-    sorted_roles = sorted(roles, key=lambda r: r.get("name", ""))
-    for role_json in sorted_roles:
+def _update_or_create_roles(roles, config: _SeedRolesConfig, platform_roles=None, resource_service=None) -> list[Role]:
+    """Update or create roles from list.
+
+    This function uses all-or-nothing semantics: if any role fails to seed after retries,
+    the entire seeding operation fails. This prevents inconsistent state where V1 roles
+    exist without their corresponding V2 SeededRoleV2 records.
+    """
+    current_roles: list[Role] = list()
+
+    for role_json in roles:
         try:
             role = _make_role(role_json, config, platform_roles, resource_service)
-            current_role_ids.add(role.id)
+            current_roles.append(role)
         except Exception as e:
-            logger.error(f"Failed to update or create system role: {role_json.get('name')} with error: {e}")
-    return current_role_ids
+            logger.error(f'Failed to update or create system role: {role_json.get("name")} with error: {e}')
+            raise
+
+    return current_roles
 
 
 # SERIALIZABLE for the same reason as _make_role above.
@@ -191,7 +214,7 @@ def seed_roles(force_create_relationships=False, force_update_relationships=Fals
         for f in os.listdir(roles_directory)
         if os.path.isfile(os.path.join(roles_directory, f)) and f.endswith(".json")
     ]
-    current_role_ids = set()
+    current_roles: list[Role] = list()
 
     platform_roles = _seed_platform_roles()
     resource_service = ImplicitResourceService.from_settings()
@@ -200,7 +223,7 @@ def seed_roles(force_create_relationships=False, force_update_relationships=Fals
         with open(role_file_path) as json_file:
             data = json.load(json_file)
             role_list = data.get("roles")
-            file_role_ids = _update_or_create_roles(
+            file_roles = _update_or_create_roles(
                 role_list,
                 _SeedRolesConfig(
                     force_create_relationships=force_create_relationships,
@@ -209,16 +232,20 @@ def seed_roles(force_create_relationships=False, force_update_relationships=Fals
                 platform_roles,
                 resource_service,
             )
-            current_role_ids.update(file_role_ids)
+            current_roles.extend(file_roles)
 
     # Find roles in DB but not in config
-    roles_to_delete = Role.objects.public_tenant_only().exclude(id__in=current_role_ids)
+    roles_to_delete = Role.objects.public_tenant_only().exclude(id__in={r.id for r in current_roles})
     logger.info(f"The following '{roles_to_delete.count()}' roles(s) eligible for removal: {roles_to_delete.values()}")
 
     if destructive_ok("seeding"):
         # Actually remove roles no longer in config.
         # We must use all() to ensure we actually load the roles within the transaction.
         _do_delete_system_roles(roles_to_delete.all())
+
+    if settings.AUTOMATIC_SCOPE_MIGRATION_ENABLED:
+        for role in current_roles:
+            migrate_role_scope_if_changed(role)
 
 
 def seed_permissions():
@@ -334,8 +361,14 @@ def _create_single_platform_role(access_type, scope, policy_service, public_tena
 
 
 def _seed_v2_role_from_v1(v1_role, display_name, description, public_tenant, platform_roles, resource_service):
-    """Create or update V2 role from V1 role during seeding."""
+    """Create or update V2 role from V1 role during seeding.
+
+    Raises on failure so the caller's transaction rolls back, ensuring V1 and V2 roles
+    are created/updated atomically.
+    """
     try:
+        # Check what scopes this role is bound at in V1 tenants to detect scope changes
+        # IMPORTANT: Check old scopes BEFORE updating the role or clearing permissions
         v2_role, v2_created = SeededRoleV2.objects.update_or_create(
             uuid=v1_role.uuid,
             defaults={
@@ -354,27 +387,44 @@ def _seed_v2_role_from_v1(v1_role, display_name, description, public_tenant, pla
         if v1_permissions:
             v2_role.permissions.set(v1_permissions)
             logger.info("Added %d permissions to V2 role %s.", len(v1_permissions), display_name)
-        scope = resource_service.scope_for_role(v1_role)
+
+        binding_scopes = resource_service.binding_scopes_for_role(v1_role)
 
         # Clear parents first since scope may have changed since previous seeding
         v2_role.parents.clear()
-        platform_role = platform_roles[(DefaultAccessType.USER, scope)]
-        if v1_role.platform_default:
-            platform_role.children.add(v2_role)
-            logger.info("Added %s as child of platform role %s", display_name, platform_role.name)
 
-        admin_scope = admin_platform_parent_scope_for_seeded_system_role(
-            v1_role.name, v1_role.admin_default, scope, apply_override=True
-        )
-        admin_platform_role = platform_roles[(DefaultAccessType.ADMIN, admin_scope)]
+        if v1_role.platform_default:
+            for scope in binding_scopes:
+                platform_role = platform_roles[(DefaultAccessType.USER, scope)]
+                platform_role.children.add(v2_role)
+                logger.info("Added %s as child of platform role %s", display_name, platform_role.name)
+
         if v1_role.admin_default:
-            admin_platform_role.children.add(v2_role)
-            logger.info("Added %s as child of admin platform role %s", display_name, admin_platform_role.name)
+            for scope in admin_platform_parent_scopes_for_seeded_system_role(v1_role.name, binding_scopes):
+                admin_platform_role = platform_roles[(DefaultAccessType.ADMIN, scope)]
+                admin_platform_role.children.add(v2_role)
+                logger.info("Added %s as child of admin platform role %s", display_name, admin_platform_role.name)
+
+        existing_scope_state: RoleScopeState = RoleScopeState.objects.filter(role=v1_role).first()
+
+        # By updating the RoleScopeState in the same transaction as which we update the role, we ensure that we can
+        # correctly detect *all* changes to the role's scopes (including those caused by settings changes rather than
+        # changes to the role itself).
+        if existing_scope_state is not None:
+            if set(existing_scope_state.computed_scopes) != set(binding_scopes):
+                existing_scope_state.version = F("version") + 1
+                existing_scope_state.computed_scopes = list(binding_scopes)
+                existing_scope_state.migrated = False
+                existing_scope_state.save()
+        else:
+            RoleScopeState.objects.create(
+                role=v1_role, version=0, computed_scopes=list(binding_scopes), migrated=False
+            )
 
         return v2_role
-    except Exception as e:
-        logger.error(f"Failed to seed V2 role for {display_name}: {e}")
-        return None
+    except Exception:
+        logger.error("Failed to seed V2 role for %s", display_name, exc_info=True)
+        raise
 
 
 def _seed_platform_roles():

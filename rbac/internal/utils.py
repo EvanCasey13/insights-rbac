@@ -28,9 +28,10 @@ from typing import Optional
 
 import jsonschema
 from django.conf import settings
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Q
 from django.urls import resolve
+from internal.pg_notify_wait import replicate_with_notify
 from internal.schemas import INVENTORY_INPUT_SCHEMAS, RELATION_INPUT_SCHEMAS
 from jsonschema import validate
 from management.atomic_transactions import atomic, atomic_block, atomic_with_retry
@@ -50,7 +51,7 @@ from management.relation_replicator.relation_replicator import (
 )
 from management.relation_replicator.relations_api_replicator import RelationsApiReplicator
 from management.relation_replicator.types import RelationTuple
-from management.role.v2_model import CustomRoleV2, RoleV2
+from management.role.v2_model import RoleV2
 from management.role_binding.model import RoleBinding, RoleBindingPrincipal
 from management.tenant_mapping.model import DefaultAccessType, TenantMapping
 from management.tenant_mapping.v2_activation import (
@@ -242,7 +243,7 @@ def _build_workspace_graph(tenant) -> tuple[list, dict]:
 
     Returns:
         tuple of:
-        - root_workspace_ids: list of workspace IDs that have no parent (parent = tenant)
+        - root_workspace_ids: list of workspace IDs with no DB parent (typically root workspace)
         - children_by_parent: dict mapping parent_id -> list of child workspace_ids
     """
     db_workspaces = list(Workspace.objects.filter(tenant=tenant).order_by("id"))
@@ -270,8 +271,7 @@ class WorkspaceProcessResult:
 
 def _process_workspace_in_transaction(
     ws_id_uuid,
-    expected_parent_type: str,
-    expected_parent_id: str,
+    expected_parent_workspace_id: str,
     tenant,
     read_tuples_fn,
     replicator,
@@ -280,13 +280,12 @@ def _process_workspace_in_transaction(
     """
     Process a single workspace within a transaction.
 
-    Locks parent (if workspace) and child, verifies parent hasn't changed,
+    Locks parent workspace then child, verifies parent hasn't changed,
     checks if parent relation exists in Kessel, and replicates if missing.
 
     Args:
         ws_id_uuid: The workspace UUID to process
-        expected_parent_type: "tenant" or "workspace"
-        expected_parent_id: The expected parent ID
+        expected_parent_workspace_id: Expected parent workspace UUID (DB `parent_id`)
         tenant: The Tenant object
         read_tuples_fn: Function to read tuples from Kessel
         replicator: The replicator to use for writing relations
@@ -298,13 +297,13 @@ def _process_workspace_in_transaction(
     result = WorkspaceProcessResult()
 
     with transaction.atomic():
-        # Lock parent first (if it's a workspace, not tenant)
-        if expected_parent_type == "workspace":
-            try:
-                Workspace.objects.select_for_update().get(id=expected_parent_id)
-            except Workspace.DoesNotExist:
-                logger.warning(f"Parent workspace {expected_parent_id} no longer exists, skipping child {ws_id_uuid}")
-                return result
+        try:
+            Workspace.objects.select_for_update().get(id=expected_parent_workspace_id)
+        except Workspace.DoesNotExist:
+            logger.warning(
+                f"Parent workspace {expected_parent_workspace_id} no longer exists, skipping child {ws_id_uuid}"
+            )
+            return result
 
         # Lock the child workspace
         try:
@@ -318,17 +317,14 @@ def _process_workspace_in_transaction(
 
         # Verify parent hasn't changed (in case of concurrent modification)
         actual_parent_id = str(ws.parent_id) if ws.parent_id else None
-        if expected_parent_type == "tenant" and actual_parent_id is not None:
-            logger.warning(f"Workspace {ws_id} parent changed from tenant to {actual_parent_id}, skipping")
-            return result
-        if expected_parent_type == "workspace" and actual_parent_id != expected_parent_id:
+        if actual_parent_id != expected_parent_workspace_id:
             logger.warning(
-                f"Workspace {ws_id} parent changed from {expected_parent_id} to {actual_parent_id}, skipping"
+                f"Workspace {ws_id} parent changed from {expected_parent_workspace_id} to {actual_parent_id}, skipping"
             )
             return result
 
         # Check if parent relation exists in Kessel
-        parent_tuples = read_tuples_fn("workspace", ws_id, "parent", expected_parent_type, expected_parent_id)
+        parent_tuples = read_tuples_fn("workspace", ws_id, "parent", "workspace", expected_parent_workspace_id)
         if parent_tuples:
             return result
 
@@ -339,8 +335,8 @@ def _process_workspace_in_transaction(
         relation = create_relationship(
             ("rbac", "workspace"),
             ws_id,
-            ("rbac", expected_parent_type),
-            expected_parent_id,
+            ("rbac", "workspace"),
+            expected_parent_workspace_id,
             "parent",
         )
 
@@ -355,10 +351,10 @@ def _process_workspace_in_transaction(
                 )
             )
             result.relations_added = 1
-            logger.info(f"Added parent relation: workspace:{ws_id}#parent@{expected_parent_type}:{expected_parent_id}")
+            logger.info(f"Added parent relation: workspace:{ws_id}#parent@workspace:{expected_parent_workspace_id}")
         else:
             result.relations_to_add_count = 1
-            logger.info(f"DRY RUN: Would add: workspace:{ws_id}#parent@{expected_parent_type}:{expected_parent_id}")
+            logger.info(f"DRY RUN: Would add: workspace:{ws_id}#parent@workspace:{expected_parent_workspace_id}")
 
     return result
 
@@ -376,11 +372,10 @@ def rebuild_tenant_workspace_relations(
     their parent relations exist in Kessel. This is a prerequisite for
     cleanup_tenant_orphaned_relationships to work correctly.
 
-    The hierarchy is: tenant -> root workspace -> default workspace -> other workspaces
-    - Root workspace has parent = tenant
-    - Other workspaces have parent = their parent workspace
+    Root workspaces are not linked to the tenant in relations; only workspace-to-workspace
+    parent edges are replicated (default -> root -> ...).
 
-    Uses BFS traversal starting from root workspace. For each workspace, locks the
+    Uses BFS traversal from each root workspace's children. For each workspace, locks the
     parent first, then locks the child, checks/replicates the parent relation,
     then moves to children. This minimizes lock contention.
 
@@ -395,8 +390,6 @@ def rebuild_tenant_workspace_relations(
     Returns:
         dict: Results including workspaces checked, relations added, etc.
     """
-    tenant_resource_id = tenant.tenant_resource_id()
-
     workspaces_checked = 0
     relations_added = 0
     relations_to_add_count = 0
@@ -405,20 +398,20 @@ def rebuild_tenant_workspace_relations(
     # Build workspace graph from DB
     root_workspace_ids, children_by_parent = _build_workspace_graph(tenant)
 
-    # Build BFS queue starting from root workspaces
+    # Build BFS queue from root workspaces' children only (no workspace#parent@tenant edge).
     queue = deque()
     for root_id in root_workspace_ids:
-        queue.append((root_id, "tenant", tenant_resource_id))
+        for child_id in children_by_parent.get(root_id, []):
+            queue.append((child_id, str(root_id)))
 
     # BFS traversal - process each workspace in transaction
     while queue:
-        ws_id_uuid, expected_parent_type, expected_parent_id = queue.popleft()
+        ws_id_uuid, expected_parent_workspace_id = queue.popleft()
 
         # Process workspace in transaction (locks parent then child)
         result = _process_workspace_in_transaction(
             ws_id_uuid,
-            expected_parent_type,
-            expected_parent_id,
+            expected_parent_workspace_id,
             tenant,
             read_tuples_fn,
             replicator,
@@ -435,7 +428,7 @@ def rebuild_tenant_workspace_relations(
         # Add children to queue for BFS (outside transaction to release locks)
         if ws_id_uuid in children_by_parent:
             for child_id in children_by_parent[ws_id_uuid]:
-                queue.append((child_id, "workspace", str(ws_id_uuid)))
+                queue.append((child_id, str(ws_id_uuid)))
 
     if dry_run and relations_to_add_count:
         logger.info(f"DRY RUN: Would add {relations_to_add_count} parent relations for tenant {tenant.org_id}")
@@ -447,6 +440,65 @@ def rebuild_tenant_workspace_relations(
         "workspaces_missing_parent": workspaces_missing_parent_count,
         "relations_to_add": relations_to_add_count if dry_run else relations_added,
         "relations_added": relations_added,
+    }
+
+
+def remove_legacy_root_workspace_tenant_parent_relations() -> dict:
+    """
+    Enqueue removal of workspace(root)#parent@tenant relationship tuples.
+
+    Bootstrapping no longer creates this edge; this job clears stale tuples still present in Kessel.
+    """
+    if not settings.REPLICATION_TO_RELATION_ENABLED:
+        return {"skipped": True, "reason": "REPLICATION_TO_RELATION_ENABLED is False"}
+
+    replicator = OutboxReplicator()
+    qs = Tenant.objects.exclude(tenant_name="public").order_by("id")
+
+    batch: list[RelationTuple] = []
+    tenants_processed = 0
+    batch_size = 500
+    tenants_total = qs.count()
+
+    def flush_batch() -> None:
+        if not batch:
+            return
+        replicate_with_notify(
+            replicator,
+            ReplicationEvent(
+                event_type=ReplicationEventType.REMOVE_ROOT_PARENT_TENANT_RELATIONSHIPS,
+                info={"batch_size": len(batch)},
+                partition_key=PartitionKey.byEnvironment(),
+                add=[],
+                remove=batch,
+            ),
+        )
+        batch.clear()
+        logger.info(f"Processed {tenants_processed} of {tenants_total} tenants")
+
+    for tenant in qs.iterator(chunk_size=500):
+        tenants_processed += 1
+        tenant_resource_id = tenant.tenant_resource_id()
+        if tenant_resource_id is None:
+            continue
+        root = Workspace.objects.root(tenant=tenant)
+        batch.append(
+            create_relationship(
+                ("rbac", "workspace"),
+                str(root.id),
+                ("rbac", "tenant"),
+                tenant_resource_id,
+                "parent",
+            )
+        )
+        if len(batch) >= batch_size:
+            flush_batch()
+
+    flush_batch()
+
+    return {
+        "skipped": False,
+        "tenants_processed": tenants_processed,
     }
 
 
@@ -498,7 +550,7 @@ def _do_replicate_missing_binding_tuples_batch(tenant_id: int, raw_role_bindings
     role_bindings = list(
         RoleBinding.objects.filter(pk__in=(b.pk for b in raw_role_bindings))
         .exclude(uuid__in=builtin_binding_ids)
-        .select_related("role")
+        .select_related("role", "role__tenant")
         .prefetch_related("group_entries", "principal_entries", "role__permissions")
         .select_for_update(of=["self"])
     )
@@ -542,14 +594,7 @@ def _do_replicate_missing_binding_tuples_batch(tenant_id: int, raw_role_bindings
         # Ensure that we additionally re-replicate the relevant role (if it's a custom role).
         if role_binding.role.type == RoleV2.Types.CUSTOM:
             if role_binding.role.id not in role_tuples_by_role_id:
-                to_add, to_remove = CustomRoleV2.replication_tuples(
-                    role=role_binding.role, new_permissions=list(role_binding.role.permissions.all())
-                )
-
-                if len(to_remove) > 0:
-                    raise AssertionError(f"Should not have relations to remove, but got: {to_remove}")
-
-                role_tuples_by_role_id[role_binding.role.id] = to_add
+                role_tuples_by_role_id[role_binding.role.id] = RoleV2.tuples_for_create(role_binding.role)
 
     replicator = OutboxReplicator()
 
@@ -855,25 +900,90 @@ def clean_invalid_workspace_resource_definitions(dry_run: bool = False) -> dict:
     return results
 
 
+class UngroupedWorkspaceError(ValueError):
+    """Raised when ungrouped-hosts workspace cannot be created with the requested ID."""
+
+
 @transaction.atomic
-def get_or_create_ungrouped_workspace(tenant: str) -> Workspace:
+def get_or_create_ungrouped_workspace(tenant: Tenant, workspace_id: Optional[uuid.UUID] = None) -> Workspace:
     """
-    Retrieve the ungrouped workspace for the given tenant.
+    Retrieve or create the ungrouped-hosts workspace for the given tenant.
 
     Args:
-        tenant (str): The tenant for which to retrieve the ungrouped workspace.
+        tenant: The tenant for which to retrieve/create the ungrouped workspace.
+        workspace_id: Optional UUID to use when creating the workspace. When the tenant
+            already has an ungrouped-hosts workspace, it must match this ID if provided.
+
     Returns:
         Workspace: The ungrouped workspace object for the given tenant.
+
+    Raises:
+        UngroupedWorkspaceError: If workspace_id conflicts with an existing workspace.
     """
-    # fetch parent only once
     default_ws = Workspace.objects.get(tenant=tenant, type=Workspace.Types.DEFAULT)
 
-    # single select_for_update + get_or_create
-    workspace, created = Workspace.objects.select_for_update().get_or_create(
-        tenant=tenant,
-        type=Workspace.Types.UNGROUPED_HOSTS,
-        defaults={"name": Workspace.SpecialNames.UNGROUPED_HOSTS, "parent": default_ws},
+    existing = (
+        Workspace.objects.select_for_update().filter(tenant=tenant, type=Workspace.Types.UNGROUPED_HOSTS).first()
     )
+    if existing:
+        if workspace_id is not None and existing.id != workspace_id:
+            raise UngroupedWorkspaceError(
+                f"Tenant org_id={tenant.org_id} already has ungrouped-hosts workspace "
+                f"{existing.id}, which does not match requested id {workspace_id}."
+            )
+        return existing
+
+    if workspace_id is not None:
+        conflict = Workspace.objects.filter(id=workspace_id).first()
+        if conflict is not None:
+            raise UngroupedWorkspaceError(
+                f"Workspace id {workspace_id} already exists "
+                f"(tenant org_id={conflict.tenant.org_id}, type={conflict.type})."
+            )
+        workspace = Workspace(
+            id=workspace_id,
+            tenant=tenant,
+            type=Workspace.Types.UNGROUPED_HOSTS,
+            name=Workspace.SpecialNames.UNGROUPED_HOSTS,
+            parent=default_ws,
+            description=Workspace.SpecialDescriptions.UNGROUPED_HOSTS,
+        )
+        try:
+            # Nested savepoint so IntegrityError does not poison the outer atomic block.
+            with transaction.atomic():
+                workspace.save()
+            created = True
+        except IntegrityError:
+            # Savepoint rolled back; outer transaction can continue with retry queries.
+            raced = (
+                Workspace.objects.select_for_update()
+                .filter(tenant=tenant, type=Workspace.Types.UNGROUPED_HOSTS)
+                .first()
+            )
+            if raced is not None:
+                if raced.id != workspace_id:
+                    raise UngroupedWorkspaceError(
+                        f"Tenant org_id={tenant.org_id} already has ungrouped-hosts workspace "
+                        f"{raced.id}, which does not match requested id {workspace_id}."
+                    ) from None
+                workspace = raced
+                created = False
+            else:
+                conflict = Workspace.objects.select_for_update().filter(id=workspace_id).first()
+                if conflict is not None:
+                    raise UngroupedWorkspaceError(
+                        f"Workspace id {workspace_id} already exists "
+                        f"(tenant org_id={conflict.tenant.org_id}, type={conflict.type})."
+                    ) from None
+                raise UngroupedWorkspaceError(
+                    f"Workspace id {workspace_id} conflicted during creation but is no longer found."
+                ) from None
+    else:
+        workspace, created = Workspace.objects.select_for_update().get_or_create(
+            tenant=tenant,
+            type=Workspace.Types.UNGROUPED_HOSTS,
+            defaults={"name": Workspace.SpecialNames.UNGROUPED_HOSTS, "parent": default_ws},
+        )
 
     if created:
         RelationApiDualWriteWorkspaceHandler(
@@ -881,6 +991,52 @@ def get_or_create_ungrouped_workspace(tenant: str) -> Workspace:
         ).replicate_new_workspace()
 
     return workspace
+
+
+def parse_bootstrap_tenant_request(body: dict) -> list[tuple[str, Optional[uuid.UUID]]]:
+    """
+    Parse bootstrap_tenant request body into (org_id, ungrouped_hosts_id) pairs.
+
+    Accepts either:
+      {"org_ids": ["12345", "67890"]}
+      {"tenants": [{"org_id": "12345", "ungrouped_hosts_id": "<uuid>"}]}
+
+    Raises:
+        ValueError: If the body is invalid.
+    """
+    if not isinstance(body, dict):
+        raise ValueError("Invalid request: body must be a JSON object.")  # pyright: ignore[reportUnreachable]
+
+    if "tenants" in body and "org_ids" in body:
+        raise ValueError('Invalid request: supply either "org_ids" or "tenants", not both.')
+
+    if "tenants" in body:
+        tenants = body["tenants"]
+        if not isinstance(tenants, list) or len(tenants) == 0:
+            raise ValueError('Invalid request: the "tenants" array must contain at least one entry.')
+
+        parsed: list[tuple[str, Optional[uuid.UUID]]] = []
+        for entry in tenants:
+            if not isinstance(entry, dict) or not entry.get("org_id"):
+                raise ValueError('Invalid request: each tenants entry must include a non-empty "org_id".')
+            org_id = str(entry["org_id"])
+            raw_id = entry.get("ungrouped_hosts_id")
+            if raw_id is None or raw_id == "":
+                parsed.append((org_id, None))
+                continue
+            try:
+                parsed.append((org_id, as_uuid(raw_id)))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f'Invalid ungrouped_hosts_id for org_id {org_id}: "{raw_id}".') from exc
+        return parsed
+
+    if "org_ids" in body:
+        org_ids = body["org_ids"]
+        if not isinstance(org_ids, list) or len(org_ids) == 0:
+            raise ValueError('Invalid request: the "org_ids" array in the body must contain at least one org_id')
+        return [(str(org_id), None) for org_id in org_ids]
+
+    raise ValueError('Invalid request: must supply "org_ids" or "tenants" in body.')
 
 
 def validate_relations_input(action, request_data) -> bool:

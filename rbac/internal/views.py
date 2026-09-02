@@ -17,6 +17,7 @@
 
 """View for internal tenant management."""
 
+import datetime
 import json
 import logging
 import uuid
@@ -28,20 +29,23 @@ from django.conf import settings
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import connection, transaction
 from django.db.migrations.recorder import MigrationRecorder
-from django.http import HttpRequest, HttpResponse, JsonResponse
+from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404
 from django.utils.html import escape
 from django.views.decorators.http import require_http_methods
 from feature_flags import FEATURE_FLAGS
 from google.protobuf import json_format
 from grpc import RpcError
+from internal.custom_v2_role_tenant_migration import replicate_custom_v2_role_owner_relationships
 from internal.errors import SentryDiagnosticError, UserNotFoundError
 from internal.jwt_utils import JWTManager, JWTProvider
 from internal.utils import (
+    UngroupedWorkspaceError,
     delete_bindings,
     fix_admin_default_bindings,
     get_or_create_ungrouped_workspace,
     load_request_body,
+    parse_bootstrap_tenant_request,
     read_tuples_from_kessel,
     rebuild_tenant_workspace_relations as rebuild_workspace_relations_util,
     validate_inventory_input,
@@ -54,13 +58,21 @@ from kessel.inventory.v1beta2 import (
     resource_reference_pb2,
     subject_reference_pb2,
 )
-from kessel.relations.v1beta1 import check_pb2, lookup_pb2, relation_tuples_pb2
-from kessel.relations.v1beta1 import check_pb2_grpc, lookup_pb2_grpc, relation_tuples_pb2_grpc
-from kessel.relations.v1beta1 import common_pb2
+from kessel.relations.v1beta1 import (
+    check_pb2,
+    check_pb2_grpc,
+    common_pb2,
+    lookup_pb2,
+    lookup_pb2_grpc,
+    relation_tuples_pb2,
+    relation_tuples_pb2_grpc,
+)
+from management.audit_log.model import AuditLog
 from management.cache import JWTCache, TenantCache
 from management.group.relation_api_dual_write_group_handler import RelationApiDualWriteGroupHandler
 from management.inventory_checker.inventory_api_check import (
     BootstrappedTenantInventoryChecker,
+    CrossAccountRequestInventoryChecker,
     GroupPrincipalInventoryChecker,
     RoleRelationInventoryChecker,
     WorkspaceRelationInventoryChecker,
@@ -69,12 +81,11 @@ from management.models import BindingMapping, Group, Permission, Principal, Reso
 from management.principal.proxy import (
     API_TOKEN_HEADER,
     CLIENT_ID_HEADER,
+    PrincipalProxy,
     USER_ENV_HEADER,
-)
-from management.principal.proxy import PrincipalProxy
-from management.principal.proxy import (
     bop_request_status_count,
     bop_request_time_tracking,
+    external_principal_to_user,
 )
 from management.relation_replicator.outbox_replicator import OutboxReplicator
 from management.relation_replicator.relation_replicator import PartitionKey, ReplicationEvent, ReplicationEventType
@@ -92,8 +103,15 @@ from management.tasks import (
     fix_missing_binding_base_tuples_in_worker,
     migrate_binding_scope_in_worker,
     migrate_data_in_worker,
+    migrate_role_scope_if_changed_in_worker,
+    recompute_tenant_role_bindings_in_worker,
+    recover_workspace_events_in_worker,
     remove_deleted_workspace_bindings_in_worker,
     remove_unassigned_system_binding_mappings_in_worker,
+    replicate_default_workspaces_in_worker,
+    replicate_deleted_workspaces_in_worker,
+    replicate_updated_workspaces_in_worker,
+    run_kessel_parity_checks_in_worker,
     run_migrations_in_worker,
     run_ocm_performance_in_worker,
     run_seeds_in_worker,
@@ -108,14 +126,14 @@ from management.utils import (
     groups_for_principal,
 )
 from management.workspace.model import Workspace
-from management.workspace.relation_api_dual_write_workspace_handler import RelationApiDualWriteWorkspaceHandler
 from management.workspace.serializer import WorkspaceSerializer
 from migration_tool.in_memory_tuples import InMemoryRelationReplicator, InMemoryTuples
 from rest_framework import status
 
 from api.common.pagination import StandardResultsSetPagination, WSGIRequestResultsSetPagination
 from api.cross_access.model import RequestsRoles
-from api.models import Tenant, User
+from api.cross_access.relation_api_dual_write_cross_access_handler import RelationApiDualWriteCrossAccessHandler
+from api.models import CrossAccountRequest, Tenant, User
 from api.tasks import (
     cross_account_cleanup,
     populate_tenant_account_id_in_worker,
@@ -227,9 +245,20 @@ def tenant_view(request, org_id):
         tenant_obj = get_object_or_404(Tenant, org_id=org_id)
         with transaction.atomic():
             if tenant_is_unmodified(tenant_name=tenant_obj.tenant_name, org_id=org_id):
-                logger.warning(f"Deleting tenant {org_id}. Requested by {request.user.username}")
                 TENANTS.delete_tenant(org_id)
                 tenant_obj.delete()
+                # Admin action - SEC-MON-REQ-1 compliance (EOI-3 admin_action, EOI-1 pii_manipulation)
+                logger.info(
+                    f"Tenant {org_id} deleted. Requested by {request.user.username}",
+                    extra={
+                        "action": "DELETE",
+                        "resource_type": "tenant",
+                        "resource_id": org_id,
+                        "outcome": "success",
+                        "org_id": getattr(request.user, "org_id", None),
+                        "username": getattr(request.user, "username", None),
+                    },
+                )
                 return HttpResponse(status=204)
             else:
                 return HttpResponse("Tenant cannot be deleted.", status=400)
@@ -242,7 +271,17 @@ def run_migrations(request):
     POST /_private/api/migrations/run/
     """
     if request.method == "POST":
-        logger.info(f"Running migrations: {request.method} {request.user.username}")
+        # Admin action - SEC-MON-REQ-1 compliance (EOI-3 admin_action, EOI-2 system_object_manipulation)
+        logger.info(
+            "Internal API: Run migrations triggered",
+            extra={
+                "action": "MIGRATE",
+                "resource_type": "database",
+                "outcome": "in_progress",
+                "org_id": getattr(request.user, "org_id", None),
+                "username": getattr(request.user, "username", None),
+            },
+        )
         run_migrations_in_worker.delay()
         return HttpResponse("Migrations are running in a background worker.", status=202)
     return HttpResponse('Invalid method, only "POST" is allowed.', status=405)
@@ -415,6 +454,8 @@ def user_lookup(request):
 
     username = request.GET.get("username")
     email = request.GET.get("email")
+    search_param = f"username='{username}'" if username else f"email='{email}'"
+    caller = getattr(getattr(request, "user", None), "username", "internal-service")
 
     try:
         validate_user_lookup_input(username, email)
@@ -424,8 +465,10 @@ def user_lookup(request):
     try:
         user = get_user_from_bop(username, email)
     except UserNotFoundError as err:
+        _log_user_lookup(caller, f"User lookup: not found ({search_param})")
         return handle_error(f"Not found - {err}", 404)
     except Exception as err:
+        _log_user_lookup(caller, f"User lookup: error querying bop ({search_param})")
         return handle_error(f"Internal error - couldn't get user from bop: {err}", 500)
 
     username = user["username"]
@@ -441,12 +484,14 @@ def user_lookup(request):
         logger.debug("queried rbac db for tenant: '%s' based on org_id: '%s'", user_tenant, user_org_id)
     except Exception as err:
         logger.error(f"error querying for tenant with org_id: '{user_org_id}' in rbac, err: {err}")
+        _log_user_lookup(caller, f"User lookup: error resolving tenant ({search_param})")
         return handle_error(f"Internal error - failed to query rbac for tenant with org_id: '{user_org_id}'", 500)
 
     try:
         principal = get_principal(username, request, verify_principal=False, from_query=False, user_tenant=user_tenant)
     except Exception as err:
         logger.error(f"error querying for principal with username: '{username}' in rbac, err: {err}")
+        _log_user_lookup(caller, f"User lookup: error resolving principal ({search_param})")
         return handle_error(f"Internal error - failed to query rbac for user: '{username}'", 500)
 
     groups = groups_for_principal(principal, user_tenant, is_org_admin=user["is_org_admin"])
@@ -482,7 +527,23 @@ def user_lookup(request):
 
     result["groups"] = user_groups
 
+    _log_user_lookup(caller, f"User lookup: found '{username}' ({search_param})", principal=principal)
+
     return HttpResponse(json.dumps(result, cls=DjangoJSONEncoder), content_type="application/json", status=200)
+
+
+def _log_user_lookup(caller, description, principal=None):
+    """Create an audit log entry for a user lookup request."""
+    try:
+        AuditLog.objects.create(
+            principal_username=caller,
+            description=description[:255],
+            resource_type=AuditLog.USER,
+            action=AuditLog.READ,
+            resource_uuid=getattr(principal, "uuid", None),
+        )
+    except Exception:
+        logger.exception("failed to create audit log for user lookup")
 
 
 def validate_user_lookup_input(username, email):
@@ -596,7 +657,17 @@ def run_seeds(request):
                 f"{force_create_option} and {force_update_option} cannot both be set to true.", status=400
             )
 
-        logger.info(f"Running seeds: {request.method} {request.user.username}")
+        # Admin action - SEC-MON-REQ-1 compliance (EOI-3 admin_action, EOI-2 system_object_manipulation)
+        logger.info(
+            "Internal API: Run seeds triggered",
+            extra={
+                "action": "SEED",
+                "resource_type": "permissions_roles_groups",
+                "outcome": "in_progress",
+                "org_id": getattr(request.user, "org_id", None),
+                "username": getattr(request.user, "username", None),
+            },
+        )
         run_seeds_in_worker.delay(args)
 
         return HttpResponse("Seeds are running in a background worker.", status=202)
@@ -671,6 +742,18 @@ def set_tenant_ready(request):
                     status=400,
                 )
             tenant_qs.update(ready=True)
+            # Admin action - SEC-MON-REQ-1 compliance (EOI-3 admin_action, EOI-2 system_object_manipulation)
+            logger.info(
+                "Internal API: Tenant ready flag updated",
+                extra={
+                    "action": "UPDATE",
+                    "resource_type": "tenant",
+                    "outcome": "success",
+                    "org_id": getattr(request.user, "org_id", None),
+                    "username": getattr(request.user, "username", None),
+                    "count": prev_count,
+                },
+            )
             return HttpResponse(
                 f"Total of {prev_count} tenants has been updated. "
                 f"{tenant_qs.count()} tenant with ready flag equal to false.",
@@ -756,7 +839,7 @@ def populate_tenant_org_id_view(request):
         except Exception as e:
             logger.error(f"Error populating tenant org_id: {str(e)}")
             return JsonResponse(
-                {"error": f"Error processing request: {str(e)}"},
+                {"error": "Error processing request"},
                 status=500,
             )
 
@@ -814,12 +897,37 @@ def role_removal(request):
         role_obj = get_object_or_404(Role, name=role_name, tenant=Tenant.objects.get(tenant_name="public"))
         with transaction.atomic():
             try:
-                logger.warning(f"Deleting role '{role_name}'. Requested by '{request.user.username}'")
                 dual_write_handler = SeedingRelationApiDualWriteHandler(role_obj)
                 dual_write_handler.replicate_deleted_system_role()
                 role_obj.delete()
+                # Admin action - SEC-MON-REQ-1 compliance (EOI-3 admin_action, EOI-2 system_object_manipulation)
+                logger.info(
+                    f"System role '{role_name}' deleted. Requested by '{request.user.username}'",
+                    extra={
+                        "action": "DELETE",
+                        "resource_type": "role",
+                        "resource_id": role_name,
+                        "outcome": "success",
+                        "org_id": getattr(request.user, "org_id", None),
+                        "username": getattr(request.user, "username", None),
+                    },
+                )
                 return HttpResponse(f"Role '{role_name}' deleted.", status=204)
             except Exception:
+                # Admin action - SEC-MON-REQ-1 compliance (EOI-3 admin_action, EOI-11 warnings_or_errors)
+                logger.error(
+                    "System role deletion failed",
+                    extra={
+                        "action": "DELETE",
+                        "resource_type": "role",
+                        "resource_id": role_name,
+                        "outcome": "failure",
+                        "org_id": getattr(request.user, "org_id", None),
+                        "username": getattr(request.user, "username", None),
+                        "reason": "deletion_error",
+                    },
+                    exc_info=True,
+                )
                 return HttpResponse("Role cannot be deleted.", status=400)
     return HttpResponse('Invalid method, only "DELETE" is allowed.', status=405)
 
@@ -845,11 +953,36 @@ def permission_removal(request):
         permission_obj = get_object_or_404(Permission, permission=permission)
         with transaction.atomic():
             try:
-                logger.warning(f"Deleting permission '{permission}'. Requested by '{request.user.username}'")
                 delete_permission(permission_obj)
+                # Admin action - SEC-MON-REQ-1 compliance (EOI-3 admin_action, EOI-2 system_object_manipulation)
+                logger.info(
+                    f"System permission '{permission}' deleted. Requested by '{request.user.username}'",
+                    extra={
+                        "action": "DELETE",
+                        "resource_type": "permission",
+                        "resource_id": permission,
+                        "outcome": "success",
+                        "org_id": getattr(request.user, "org_id", None),
+                        "username": getattr(request.user, "username", None),
+                    },
+                )
                 return HttpResponse(f"Permission '{permission}' deleted.", status=204)
-            except Exception as e:
-                return HttpResponse(f"Permission cannot be deleted. {str(e)}", status=400)
+            except Exception:
+                # Admin action - SEC-MON-REQ-1 compliance (EOI-3 admin_action, EOI-11 warnings_or_errors)
+                logger.error(
+                    "System permission deletion failed",
+                    extra={
+                        "action": "DELETE",
+                        "resource_type": "permission",
+                        "resource_id": permission,
+                        "outcome": "failure",
+                        "org_id": getattr(request.user, "org_id", None),
+                        "username": getattr(request.user, "username", None),
+                        "reason": "deletion_error",
+                    },
+                    exc_info=True,
+                )
+                return HttpResponse("Permission cannot be deleted.", status=400)
     return HttpResponse('Invalid method, only "DELETE" is allowed.', status=405)
 
 
@@ -894,6 +1027,18 @@ def data_migration(request):
         "write_relationships": request.GET.get("write_relationships", "False"),
         "skip_roles": request.GET.get("skip_roles", "False").lower() == "true",
     }
+    # Admin action - SEC-MON-REQ-1 compliance (EOI-3 admin_action, EOI-2 system_object_manipulation)
+    logger.info(
+        "Internal API: Data migration triggered",
+        extra={
+            "action": "MIGRATE",
+            "resource_type": "database",
+            "outcome": "in_progress",
+            "org_id": getattr(request.user, "org_id", None),
+            "username": getattr(request.user, "username", None),
+            "target_orgs": args.get("orgs"),
+        },
+    )
     migrate_data_in_worker.delay(args)
     return HttpResponse("Data migration from V1 to V2 are running in a background worker.", status=202)
 
@@ -972,9 +1117,16 @@ def fetch_replication_data(request):
 def bootstrap_tenant(request):
     """View method for bootstrapping a tenant.
 
-    POST /_private/api/utils/bootstrap_tenant/?force=false&force_admin_only=false
+    POST /_private/api/utils/bootstrap_tenant/?force=false&force_admin_only=false&create_missing=false
 
-    Body: {"org_ids": ["12345", "67890"]}
+    Body (legacy):
+        {"org_ids": ["12345", "67890"]}
+
+    Body (extended):
+        {"tenants": [{"org_id": "12345", "ungrouped_hosts_id": "<uuid>"}]}
+
+    When ungrouped_hosts_id is provided, an ungrouped-hosts workspace is created with
+    that UUID under the default workspace and replicated to Relations.
 
     force:
         Whether or not to force replication to happen, even if the Tenant is already bootstrapped.
@@ -984,23 +1136,44 @@ def bootstrap_tenant(request):
         Re-replicate only admin default bindings. This is SAFE even when replication is on because
         admin default bindings are NOT customizable (unlike platform default bindings).
         Use this to fix tenants that were bootstrapped before admin default groups were seeded.
+        Ignores ungrouped_hosts_id and create_missing.
+
+    create_missing:
+        When 'true', create a Tenant row if one does not exist for the org_id, then bootstrap it.
+        Default is 'false' (return 404 for missing tenants) to avoid accidental tenant creation.
     """
     if request.method != "POST":
         return HttpResponse('Invalid method, only "POST" is allowed.', status=405)
     logger.info("Running bootstrap tenant.")
 
     if not request.body:
-        return HttpResponse('Invalid request, must supply the "org_ids" in body.', status=400)
+        return HttpResponse('Invalid request, must supply "org_ids" or "tenants" in body.', status=400)
 
-    org_ids_data = json.loads(request.body.decode("utf-8").replace("'", '"'))
+    try:
+        raw_body = request.body.decode("utf-8")
+        try:
+            body = json.loads(raw_body)
+        except json.JSONDecodeError as primary_exc:
+            # Legacy org_ids clients may send single-quoted JSON. Do not apply this
+            # rewrite when the payload uses the tenants format — apostrophes in values
+            # (e.g. org_id "O'Reilly") would be silently corrupted.
+            try:
+                legacy_body = json.loads(raw_body.replace("'", '"'))
+            except json.JSONDecodeError:
+                return HttpResponse(str(primary_exc), status=400, content_type="text/plain")
+            if isinstance(legacy_body, dict) and "tenants" in legacy_body:
+                return HttpResponse(str(primary_exc), status=400, content_type="text/plain")
+            body = legacy_body
+        tenants_to_bootstrap = parse_bootstrap_tenant_request(body)
+    except UnicodeDecodeError:
+        return HttpResponse("Invalid request: body must be valid UTF-8.", status=400, content_type="text/plain")
+    except (json.JSONDecodeError, ValueError) as exc:
+        return HttpResponse(str(exc), status=400, content_type="text/plain")
+
     force = request.GET.get("force", "false").lower() == "true"
     force_admin_only = request.GET.get("force_admin_only", "false").lower() == "true"
-
-    if "org_ids" not in org_ids_data or len(org_ids_data["org_ids"]) == 0:
-        return HttpResponse(
-            'Invalid request: the "org_ids" array in the body must contain at least one org_id', status=400
-        )
-    org_ids = org_ids_data["org_ids"]
+    create_missing = request.GET.get("create_missing", "false").lower() == "true"
+    org_ids = [org_id for org_id, _ in tenants_to_bootstrap]
 
     # force=true has race condition risk with custom default group creation
     # force_admin_only=true is safe because admin default bindings are not customizable
@@ -1016,11 +1189,36 @@ def bootstrap_tenant(request):
         results = [fix_admin_default_bindings(org_id) for org_id in org_ids]
         return JsonResponse({"results": results}, status=200)
 
-    with transaction.atomic():
-        bootstrap_service = V2TenantBootstrapService(OutboxReplicator())
-        for org_id in org_ids:
-            tenant = get_object_or_404(Tenant, org_id=org_id)
-            bootstrap_service.bootstrap_tenant(tenant, force=force)
+    try:
+        with transaction.atomic():
+            bootstrap_service = V2TenantBootstrapService(OutboxReplicator())
+            for org_id, ungrouped_hosts_id in tenants_to_bootstrap:
+                if create_missing:
+                    tenant, _ = Tenant.objects.get_or_create(
+                        org_id=org_id,
+                        defaults={"tenant_name": f"org{org_id}", "ready": False},
+                    )
+                else:
+                    tenant = get_object_or_404(Tenant, org_id=org_id)
+                bootstrap_service.bootstrap_tenant(tenant, force=force)
+                if ungrouped_hosts_id is not None:
+                    get_or_create_ungrouped_workspace(tenant, workspace_id=ungrouped_hosts_id)
+    except UngroupedWorkspaceError as exc:
+        return HttpResponse(str(exc), status=400, content_type="text/plain")
+    # Admin action - SEC-MON-REQ-1 compliance (EOI-3 admin_action, EOI-2 system_object_manipulation)
+    logger.info(
+        "Internal API: Tenant bootstrap completed",
+        extra={
+            "action": "CREATE",
+            "resource_type": "tenant",
+            "outcome": "success",
+            "org_id": getattr(request.user, "org_id", None),
+            "username": getattr(request.user, "username", None),
+            "target_org_ids": org_ids,
+            "force": force,
+            "create_missing": create_missing,
+        },
+    )
     return HttpResponse(f"Bootstrapping tenants with org_ids {org_ids} were finished.", status=200)
 
 
@@ -1248,6 +1446,21 @@ def reset_imported_tenants(request: HttpRequest) -> HttpResponse:
             return HttpResponse("Destructive operations disallowed.", status=400)
 
         run_reset_imported_tenants.delay({"query": query, "limit": limit, "excluded": excluded})
+
+        # Admin action - SEC-MON-REQ-1 compliance (EOI-3 admin_action, EOI-1 pii_manipulation)
+        logger.info(
+            "Bulk tenant deletion initiated",
+            extra={
+                "action": "DELETE",
+                "resource_type": "tenant",
+                "resource_id": f"bulk_deletion_limit_{limit}",
+                "outcome": "in_progress",
+                "org_id": getattr(request.user, "org_id", None),
+                "username": getattr(request.user, "username", None),
+                "limit": limit,
+                "excluded_count": len(excluded) if excluded else 0,
+            },
+        )
 
         return HttpResponse("Tenants deleting in worker.", status=200)
 
@@ -1933,38 +2146,37 @@ def check_inventory(request):
 def check_bootstrapped_tenants(request, org_id):
     """POST to check if bootstrapped tenant is correct on inventory api."""
     tenant = get_object_or_404(Tenant, org_id=org_id)
-    if tenant and tenant.tenant_mapping:
-        default_workspace = Workspace.objects.default(tenant=tenant)
-        root_workspace = Workspace.objects.root(tenant=tenant)
-        mapping = {
-            "org_id": tenant.org_id,
-            "root_workspace": str(root_workspace.id),
-            "default_workspace": str(default_workspace.id),
-            "tenant_mapping": {
-                "default_group_uuid": str(tenant.tenant_mapping.default_group_uuid),
-                "default_admin_group_uuid": str(tenant.tenant_mapping.default_admin_group_uuid),
-                "default_role_binding_uuid": str(tenant.tenant_mapping.default_role_binding_uuid),
-                "default_admin_role_binding_uuid": str(tenant.tenant_mapping.default_admin_role_binding_uuid),
-            },
-        }
-        try:
-            bootstrap_tenants_correct, checks = BootstrappedTenantChecker.check_bootstrapped_tenants(mapping)
-            bootstrapped_tenant_response = {
+    if not hasattr(tenant, "tenant_mapping"):
+        return JsonResponse({"detail": f"No tenant mapping for org_id: {org_id}"}, status=404)
+
+    default_workspace = Workspace.objects.default(tenant=tenant)
+    root_workspace = Workspace.objects.root(tenant=tenant)
+    ungrouped = Workspace.objects.filter(tenant=tenant, type=Workspace.Types.UNGROUPED_HOSTS).first()
+    try:
+        bootstrap_tenants_correct, checks = BootstrappedTenantChecker.check_bootstrapped_tenant(
+            org_id=tenant.org_id,
+            tenant_mapping=tenant.tenant_mapping,
+            root_workspace_id=str(root_workspace.id),
+            default_workspace_id=str(default_workspace.id),
+            ungrouped_workspace_id=str(ungrouped.id) if ungrouped else None,
+        )
+        return JsonResponse(
+            {
                 "org_id": tenant.org_id,
                 "bootstrapped_correct": bootstrap_tenants_correct,
                 "relations_checked": checks,
-            }
-        except RpcError as e:
-            return JsonResponse(
-                {"detail": "gRPC error occurred during inventory bootstrapped tenant check", "error": str(e)},
-                status=400,
-            )
-        except Exception as e:
-            return JsonResponse(
-                {"detail": "Unexpected error during inventory bootstrapped tenant check", "error": str(e)},
-                status=500,
-            )
-    return JsonResponse(bootstrapped_tenant_response, safe=False)
+            },
+        )
+    except RpcError as e:
+        return JsonResponse(
+            {"detail": "gRPC error occurred during inventory bootstrapped tenant check", "error": str(e)},
+            status=400,
+        )
+    except Exception as e:
+        return JsonResponse(
+            {"detail": "Unexpected error during inventory bootstrapped tenant check", "error": str(e)},
+            status=500,
+        )
 
 
 def check_workspace_relation(request, workspace_uuid):
@@ -1982,7 +2194,9 @@ def check_workspace_relation(request, workspace_uuid):
         try:
             if workspace_pairs:
                 workspace_uuid = str(workspace_uuid)
-                workspace_descendants_correct = WorkspaceRelationChecker.check_workspace_descendants(workspace_pairs)
+                workspace_descendants_correct, _ = WorkspaceRelationChecker.check_workspace_descendants(
+                    workspace_pairs
+                )
                 response = {
                     "org_id": workspace.tenant.org_id,
                     "workspace_id": workspace_uuid,
@@ -2084,6 +2298,8 @@ def check_role(request, role_uuid):
                 },
             }
         )
+    except Http404:
+        raise
     except RpcError as e:
         return JsonResponse(
             {"detail": "gRPC error occurred during inventory role relation check", "error": str(e)},
@@ -2095,103 +2311,87 @@ def check_role(request, role_uuid):
         )
 
 
-@require_http_methods(["GET", "DELETE"])
-def workspace_removal(request):
+def check_cross_account_request(request, request_id):
+    """Check an approved cross account request has correct relations on Inventory API.
+
+    Re-runs the CAR dual writer with an in-memory replicator to determine the expected
+    relation tuples, then verifies each exists in the Inventory API.
+
+    The InMemoryRelationReplicator used here has no external side effects — it writes
+    only to an in-memory tuple store — so the transaction.atomic() + set_rollback(True)
+    block safely prevents any DB mutations without risk of non-transactional side effects.
     """
-    Get or delete standard workspaces.
+    try:
+        car = get_object_or_404(CrossAccountRequest, request_id=request_id)
 
-    GET /_private/api/utils/workspace/
-        ?detail=false (default) : return count only
-        ?detail=true            : return list of standard workspaces
-
-    DELETE /_private/api/utils/workspace/
-        ?id=<workspace_id>                  : delete a single workspace
-        (no id)                             : delete all standard workspaces
-        ?without_child_only=false (default) : delete all standard workspaces
-        ?without_child_only=true            : delete only standard workspaces without children
-    """
-    query_params = request.GET
-    logger.info(f"Workspace list or removal: {request.method} {request.user.username}")
-
-    if request.method == "DELETE" and not destructive_ok("api"):
-        return HttpResponse("Destructive operations disallowed.", status=403)
-
-    # GET
-    if request.method == "GET":
-        if query_params.get("detail") == "true":
-            workspaces = Workspace.objects.filter(type=Workspace.Types.STANDARD)
-            serialized_ws = WorkspaceSerializer(workspaces, many=True).data
-            # Add tenant id into response
-            for ws_obj, ws_data in zip(workspaces, serialized_ws):
-                ws_data["tenant_id"] = ws_obj.tenant_id
-            payload = {"count": len(serialized_ws), "data": serialized_ws}
-            return JsonResponse(payload, status=200)
-
-        ws_count = Workspace.objects.filter(type=Workspace.Types.STANDARD).count()
-        return HttpResponse(
-            f"{ws_count} standard workspace(s) eligible for removal.", content_type="text/plain", status=200
-        )
-
-    # DELETE
-    # delete 1 standard workspace
-    if ws_id := query_params.get("id"):
-        try:
-            uuid.UUID(str(ws_id))
-        except ValueError:
-            return HttpResponse("Invalid workspace id format.", content_type="text/plain", status=400)
-
-        if not Workspace.objects.filter(type=Workspace.Types.STANDARD, id=ws_id).first():
-            return HttpResponse(
-                f"Standard workspace with id='{ws_id}' not found.", content_type="text/plain", status=404
+        if car.status != CrossAccountRequest.STATUS_APPROVED:
+            return JsonResponse(
+                {"detail": f"Cross account request {request_id} is not approved (status: {car.status})."},
+                status=400,
             )
 
-        if ws := Workspace.objects.filter(type=Workspace.Types.STANDARD, id=ws_id, children__isnull=True).first():
-            try:
-                with transaction.atomic():
-                    dual_write_handler = RelationApiDualWriteWorkspaceHandler(
-                        ws, ReplicationEventType.DELETE_WORKSPACE
-                    )
-                    dual_write_handler.replicate_deleted_workspace(skip_ws_events=True)
-                    ws.delete()
-                logger.info(f"Deleted workspace id='{ws_id}'")
-                return HttpResponse(f"Workspace with id='{ws_id}' deleted.", content_type="text/plain", status=200)
-            except Exception as e:
-                logger.exception(f"Workspace id='{ws_id}' deletion failed: {e}")
-                return HttpResponse(str(e), status=500)
+        cross_account_roles = car.roles.all()
+        if not cross_account_roles.exists():
+            return JsonResponse(
+                {
+                    "cross_account_request_checks": {
+                        "request_id": str(car.request_id),
+                        "target_org": car.target_org,
+                        "user_id": car.user_id,
+                        "status": car.status,
+                        "roles": [],
+                        "relations_correct": True,
+                    },
+                }
+            )
 
-        return HttpResponse(
-            f"Workspace with id='{ws_id}' cannot be removed because it has child workspace.",
-            content_type="text/plain",
+        tuples = InMemoryTuples()
+
+        with transaction.atomic():
+            handler = RelationApiDualWriteCrossAccessHandler(
+                cross_account_request=car,
+                event_type=ReplicationEventType.APPROVE_CROSS_ACCOUNT_REQUEST,
+                replicator=InMemoryRelationReplicator(tuples),
+            )
+            handler.generate_relations_to_add_roles(cross_account_roles)
+            handler.replicate()
+
+            # Ensure that we don't accidentally update any models.
+            transaction.set_rollback(True)
+
+        car_checker = CrossAccountRequestInventoryChecker()
+        car_correct = car_checker.check_cross_account_request(list(tuples), str(car.request_id))
+
+        return JsonResponse(
+            {
+                "cross_account_request_checks": {
+                    "request_id": str(car.request_id),
+                    "target_org": car.target_org,
+                    "user_id": car.user_id,
+                    "status": car.status,
+                    "roles": [str(r.uuid) for r in cross_account_roles],
+                    "relations_correct": car_correct,
+                },
+            }
+        )
+    except Http404:
+        raise
+    except RpcError as e:
+        return JsonResponse(
+            {
+                "detail": "gRPC error occurred during inventory cross account request check",
+                "error": str(e),
+            },
             status=400,
         )
-
-    # delete all standard workspaces
-    ws_count = Workspace.objects.filter(type=Workspace.Types.STANDARD).count()
-    try:
-        with transaction.atomic():
-            while True:
-                workspaces = Workspace.objects.filter(type=Workspace.Types.STANDARD, children__isnull=True)
-                ws_without_child_count = workspaces.count()
-                if not workspaces:
-                    break
-                for ws in workspaces:
-                    dual_write_handler = RelationApiDualWriteWorkspaceHandler(
-                        ws, ReplicationEventType.DELETE_WORKSPACE
-                    )
-                    dual_write_handler.replicate_deleted_workspace(skip_ws_events=True)
-                    ws.delete()
-                if query_params.get("without_child_only", "") == "true":
-                    return HttpResponse(
-                        f"{ws_without_child_count} workspace(s) deleted, "
-                        f"another {ws_count - ws_without_child_count} standard workspace(s) exist in database.",
-                        content_type="text/plain",
-                        status=200,
-                    )
-        logger.info("All standard workspaces successfully deleted.")
-        return HttpResponse(f"{ws_count} workspace(s) deleted.", content_type="text/plain", status=200)
-    except Exception as e:
-        logger.exception(f"Bulk workspace deletion failed: {e}")
-        return HttpResponse(str(e), status=500)
+    except Exception:
+        logger.exception("Unexpected error during inventory cross account request check")
+        return JsonResponse(
+            {
+                "detail": "Unexpected error during inventory cross account request check",
+            },
+            status=500,
+        )
 
 
 def send_kafka_test_message(request):
@@ -2208,8 +2408,9 @@ def send_kafka_test_message(request):
         return HttpResponse("Kafka is not enabled", status=400)
 
     try:
-        from core.kafka import RBACProducer
         import uuid
+
+        from core.kafka import RBACProducer
 
         # Create sample test data
         relations_to_add = [
@@ -2253,7 +2454,8 @@ def send_kafka_test_message(request):
         if not topic:
             return HttpResponse("RBAC_KAFKA_CONSUMER_TOPIC is not configured", status=400)
 
-        producer.send_kafka_message(topic, debezium_message)
+        if not producer.send_kafka_message(topic, debezium_message):
+            return JsonResponse({"error": "Failed to send Kafka message"}, status=500)
 
         logger.info(f"Test Kafka message sent to topic '{topic}' by user '{request.user.username}'")
 
@@ -2424,7 +2626,19 @@ def cleanup_tenant_orphan_bindings(request, org_id):
             status=404,
         )
 
-    logger.info(f"Queuing cleanup task for tenant {org_id} (dry_run={dry_run})")
+    # Admin action - SEC-MON-REQ-1 compliance (EOI-3 admin_action, EOI-1 pii_manipulation)
+    logger.info(
+        "Internal API: Cleanup tenant orphan bindings triggered",
+        extra={
+            "action": "CLEANUP",
+            "resource_type": "role_binding",
+            "outcome": "in_progress",
+            "org_id": getattr(request.user, "org_id", None),
+            "username": getattr(request.user, "username", None),
+            "target_org_id": org_id,
+            "dry_run": dry_run,
+        },
+    )
 
     # Queue the task
     cleanup_tenant_orphan_bindings_in_worker.delay(org_id=org_id, dry_run=dry_run)
@@ -2496,7 +2710,19 @@ def rebuild_tenant_workspace_relations(request, org_id):
             status=404,
         )
 
-    logger.info(f"Rebuilding workspace relations for tenant {org_id} (dry_run={dry_run})")
+    # Admin action - SEC-MON-REQ-1 compliance (EOI-3 admin_action, EOI-2 system_object_manipulation)
+    logger.info(
+        "Internal API: Rebuild tenant workspace relations",
+        extra={
+            "action": "REBUILD",
+            "resource_type": "workspace",
+            "outcome": "in_progress",
+            "org_id": getattr(request.user, "org_id", None),
+            "username": getattr(request.user, "username", None),
+            "target_org_id": org_id,
+            "dry_run": dry_run,
+        },
+    )
 
     # Create a read_tuples function that wraps the internal read_tuples_from_kessel
     def read_tuples_fn(resource_type, resource_id, relation, subject_type="", subject_id=""):
@@ -2516,6 +2742,18 @@ def rebuild_tenant_workspace_relations(request, org_id):
             read_tuples_fn=read_tuples_fn,
             replicator=replicator,
             dry_run=dry_run,
+        )
+        # Admin action - SEC-MON-REQ-1 compliance (EOI-3 admin_action, EOI-2 system_object_manipulation)
+        logger.info(
+            "Internal API: Rebuild tenant workspace relations completed",
+            extra={
+                "action": "REBUILD",
+                "resource_type": "workspace",
+                "outcome": "success",
+                "org_id": getattr(request.user, "org_id", None),
+                "username": getattr(request.user, "username", None),
+                "target_org_id": org_id,
+            },
         )
         return JsonResponse(result, status=200)
     except Exception as e:
@@ -2578,3 +2816,598 @@ def remove_deleted_workspace_bindings(request):
     except Exception as e:
         logger.exception("Error removing bindings for deleted workspaces", exc_info=True)
         return JsonResponse({"detail": f"Error removing bindings for deleted workspaces: {str(e)}"}, status=500)
+
+
+@require_http_methods(["POST"])
+def migrate_custom_v2_roles_to_tenant(request):
+    """Replicate owner tuples for custom V2 roles from each role's tenant resource id.
+
+    POST /_private/api/utils/migrate_custom_v2_roles_to_tenant/
+
+    Iterates ``RoleV2`` with ``type=custom`` (scans custom roles only, not every tenant row). With
+    ``tenant`` loaded, emits ``rbac/role#owner@rbac/tenant`` for ``tenant.tenant_resource_id()``.
+    Fails with 500 if any custom role's tenant has no resource id. Does not update role rows.
+
+    Returns:
+        JSON with ``replicated``, ``skipped``, and counts.
+    """
+    logger.info("migrate_custom_v2_roles_to_tenant")
+
+    try:
+        result = replicate_custom_v2_role_owner_relationships()
+        return JsonResponse(result, status=200)
+    except Exception as e:
+        logger.exception("migrate_custom_v2_roles_to_tenant failed", exc_info=True)
+        return JsonResponse({"detail": str(e)}, status=500)
+
+
+@require_http_methods(["GET", "PUT", "DELETE"])
+def mcp_tool_descriptions(request, tool_name=None):
+    """Manage MCP tool description overrides stored in Redis.
+
+    GET  /_private/api/utils/mcp_tool_descriptions/           → list all overrides
+    GET  /_private/api/utils/mcp_tool_descriptions/<name>/    → get override for one tool
+    PUT  /_private/api/utils/mcp_tool_descriptions/<name>/    → set override
+    DELETE /_private/api/utils/mcp_tool_descriptions/<name>/  → remove override (revert to default)
+    """
+    from management.mcp_views import (
+        _TOOL_CONFIG,
+        _delete_description_override,
+        _get_all_description_overrides,
+        _get_description_override,
+        _get_tools,
+        _set_description_override,
+    )
+
+    if request.method == "GET" and tool_name is None:
+        overrides = _get_all_description_overrides()
+        defaults = {tool.name: tool.description or "" for tool in _get_tools()}
+        tools = []
+        for name, default_desc in sorted(defaults.items()):
+            override = overrides.get(name)
+            tools.append(
+                {
+                    "tool_name": name,
+                    "default_description": default_desc,
+                    "override_description": override,
+                    "active_description": override if override is not None else default_desc,
+                }
+            )
+        return JsonResponse({"tools": tools}, status=200)
+
+    if tool_name is None:
+        return JsonResponse({"detail": "tool_name is required for PUT/DELETE"}, status=400)
+
+    if tool_name not in _TOOL_CONFIG:
+        return JsonResponse({"detail": f"Unknown tool: {tool_name}"}, status=404)
+
+    if request.method == "GET":
+        override = _get_description_override(tool_name)
+        default_desc = next((t.description or "" for t in _get_tools() if t.name == tool_name), "")
+        return JsonResponse(
+            {
+                "tool_name": tool_name,
+                "default_description": default_desc,
+                "override_description": override,
+                "active_description": override if override is not None else default_desc,
+            },
+            status=200,
+        )
+
+    if request.method == "PUT":
+        body = load_request_body(request)
+        description = body.get("description")
+        if not description:
+            return JsonResponse({"detail": "Missing required field: description"}, status=400)
+        _set_description_override(tool_name, description)
+        logger.info("mcp: description override set for tool=%s", tool_name)
+        return JsonResponse({"tool_name": tool_name, "override_description": description}, status=200)
+
+    if request.method == "DELETE":
+        _delete_description_override(tool_name)
+        logger.info("mcp: description override removed for tool=%s", tool_name)
+        default_desc = next((t.description or "" for t in _get_tools() if t.name == tool_name), "")
+        return JsonResponse(
+            {"tool_name": tool_name, "override_description": None, "active_description": default_desc}, status=200
+        )
+
+
+@require_http_methods(["POST"])
+def replicate_default_workspaces(request):
+    """Replicate existing default workspaces.
+
+    POST /_private/api/utils/replicate_default_workspaces/?limit=<limit>
+
+    Replicates existing default workspaces to the outbox using the BULK WorkspaceEventStream.
+
+    If limit is passed, only the specified number of workspaces are replicated. Otherwise, all default workspaces
+    are replicated.
+
+    Returns:
+        JSON response indicating the task has been queued
+    """
+    raw_limit = request.GET.get("limit")
+    limit = int(raw_limit) if raw_limit is not None else None
+
+    try:
+        replicate_default_workspaces_in_worker.delay(limit=limit)
+        return JsonResponse({"message": "Replication enqueued in background worker."}, status=202)
+    except Exception as e:
+        logger.exception("Error replicating default workspaces", exc_info=True)
+        return JsonResponse({"detail": f"Error replicating default workspaces: {str(e)}"}, status=500)
+
+
+@require_http_methods(["POST"])
+def replicate_updated_workspaces(request):
+    """Replicate workspaces updated since the provided time.
+
+    POST /_private/api/utils/replicate_updated_workspaces/
+        ?since=<timestamp>
+        &stream=<stream>
+        &exclude_unchanged_default_workspaces=<bool>
+
+    since must be an ISO 8601 datetime string (e.g. 2026-01-01T18:00:00Z).
+    stream must be either "standard" or "bulk".
+
+    Returns:
+        JSON response indicating the task has been queued
+    """
+    if "since" not in request.GET:
+        return JsonResponse({"field": "since", "detail": 'missing query parameter "since"'}, status=400)
+
+    if "stream" not in request.GET:
+        return JsonResponse({"field": "stream", "detail": 'missing query parameter "stream"'}, status=400)
+
+    since = request.GET["since"]
+    stream = request.GET["stream"]
+    exclude_unchanged_default_workspaces = (
+        request.GET.get("exclude_unchanged_default_workspaces", "false").lower() == "true"
+    )
+
+    try:
+        parsed_since = datetime.datetime.fromisoformat(since)
+
+        if parsed_since.tzinfo is None:
+            return JsonResponse({"field": "since", "detail": "since time must have timezone"}, status=400)
+    except ValueError as e:
+        return JsonResponse({"field": "since", "detail": f"invalid datetime: {str(e)}"}, status=400)
+
+    if stream not in ("standard", "bulk"):
+        return JsonResponse({"field": "stream", "detail": f"invalid stream name: {stream}"}, status=400)
+
+    try:
+        replicate_updated_workspaces_in_worker.delay(
+            since=since,
+            stream=stream,
+            exclude_unchanged_default_workspaces=exclude_unchanged_default_workspaces,
+        )
+
+        return JsonResponse(
+            {
+                "message": "Replication enqueued in background worker.",
+                "since": since,
+                "stream": stream,
+                "exclude_unchanged_default_workspaces": exclude_unchanged_default_workspaces,
+            },
+            status=202,
+        )
+    except Exception as e:
+        logger.exception("Error replicating updated workspaces", exc_info=True)
+        return JsonResponse({"detail": f"Error replicating updated workspaces: {str(e)}"}, status=500)
+
+
+@require_http_methods(["POST"])
+def replicate_deleted_workspaces(request):
+    """Replicate the deletion of workspaces deleted since the provided time.
+
+    POST /_private/api/utils/replicate_deleted_workspaces/?since=<timestamp>
+
+    since must be an ISO 8601 datetime string (e.g. 2026-01-01T18:00:00Z).
+
+    Returns:
+        JSON response indicating the task has been queued
+    """
+    if "since" not in request.GET:
+        return JsonResponse({"field": "since", "detail": 'missing query parameter "since"'}, status=400)
+
+    since = request.GET["since"]
+
+    try:
+        parsed_since = datetime.datetime.fromisoformat(since)
+
+        if parsed_since.tzinfo is None:
+            return JsonResponse({"field": "since", "detail": "since time must have timezone"}, status=400)
+    except ValueError as e:
+        return JsonResponse({"field": "since", "detail": f"invalid datetime: {str(e)}"}, status=400)
+
+    try:
+        replicate_deleted_workspaces_in_worker.delay(since=since)
+
+        return JsonResponse(
+            {
+                "message": "Replication enqueued in background worker.",
+                "since": since,
+            },
+            status=202,
+        )
+    except Exception as e:
+        logger.exception("Error replicating deleted workspaces", exc_info=True)
+        return JsonResponse({"detail": f"Error replicating deleted workspaces: {str(e)}"}, status=500)
+
+
+@require_http_methods(["POST"])
+def recompute_tenant_role_bindings(request, org_id):
+    """
+    Recompute all role bindings for a tenant.
+
+    POST /_private/api/utils/recompute_tenant_role_bindings/<org_id>/
+
+    This endpoint should be used for V1 tenants that have gotten into an inconsistent V2 state.
+
+    Returns:
+        JSON response indicating the task has been queued
+    """
+    # Validate tenant exists
+    tenant = get_object_or_404(Tenant, org_id=org_id)
+
+    try:
+        recompute_tenant_role_bindings_in_worker.delay(org_id=tenant.org_id)
+        return JsonResponse({"message": "Job enqueued in background worker."}, status=202)
+    except Exception as e:
+        logger.exception(f"Error recomputing role bindings for tenant {org_id}")
+        return JsonResponse(
+            {"detail": f"Error recomputing role bindings for tenant: {str(e)}"},
+            status=500,
+        )
+
+
+@require_http_methods(["POST"])
+def migrate_role_scope_if_changed(request, role_uuid):
+    """
+    Migrate existing role bindings for a role if its scope has changed.
+
+    POST /_private/api/utils/migrate_role_scope_if_changed/<role_uuid>/
+
+    Returns:
+        JSON response indicating the task has been queued
+    """
+    try:
+        parsed_uuid = uuid.UUID(role_uuid)
+    except ValueError:
+        return JsonResponse({"message": f"invalid UUID: {role_uuid}"}, status=400)
+
+    if not Role.objects.public_tenant_only().filter(uuid=role_uuid, system=True).exists():
+        return JsonResponse({"message": f"role does not exist; UUID: {str(parsed_uuid)}"}, status=404)
+
+    try:
+        migrate_role_scope_if_changed_in_worker.delay(role_uuid=str(parsed_uuid))
+        return JsonResponse({"message": "Job enqueued in background worker."}, status=202)
+    except Exception as e:
+        logger.exception(f"Error migrating scope for role {parsed_uuid}")
+        return JsonResponse(
+            {"detail": f"Error migrating scope for role: {str(e)}"},
+            status=500,
+        )
+
+
+@require_http_methods(["POST"])
+def recover_workspace_events(request: HttpRequest) -> JsonResponse:
+    """Trigger corrective workspace event generation after a DB restore.
+
+    POST /_private/api/disaster_recovery/workspaces/
+
+    Accepts JSON body:
+        {
+            "restore_timestamp": "2026-05-28T10:00:00Z",
+            "buffer_minutes": 5
+        }
+
+    Returns 202 with task_id on success.
+    """
+    if not getattr(settings, "DR_WORKSPACE_RECONCILE_ENABLED", False):
+        return JsonResponse({"detail": "DR recovery is disabled (DR_WORKSPACE_RECONCILE_ENABLED=False)"}, status=403)
+
+    try:
+        body = load_request_body(request)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return JsonResponse({"detail": "Invalid JSON body"}, status=400)
+
+    restore_timestamp = body.get("restore_timestamp")
+    if not restore_timestamp:
+        return JsonResponse({"detail": "restore_timestamp is required"}, status=400)
+
+    try:
+        parsed_ts = datetime.datetime.fromisoformat(restore_timestamp)
+    except (ValueError, TypeError):
+        return JsonResponse({"detail": "restore_timestamp must be a valid ISO 8601 datetime"}, status=400)
+
+    if parsed_ts.tzinfo is None:
+        parsed_ts = parsed_ts.replace(tzinfo=datetime.timezone.utc)
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if parsed_ts > now:
+        return JsonResponse({"detail": "restore_timestamp must be in the past"}, status=400)
+
+    buffer_minutes = body.get("buffer_minutes", 5)
+    if isinstance(buffer_minutes, bool) or not isinstance(buffer_minutes, int) or buffer_minutes < 0:
+        return JsonResponse({"detail": "buffer_minutes must be a non-negative integer"}, status=400)
+
+    dry_run = body.get("dry_run", False)
+    if not isinstance(dry_run, bool):
+        return JsonResponse({"detail": "dry_run must be a boolean"}, status=400)
+
+    try:
+        task = recover_workspace_events_in_worker.delay(
+            restore_timestamp_iso=restore_timestamp,
+            buffer_minutes=buffer_minutes,
+            dry_run=dry_run,
+        )
+        logger.info(
+            "Workspace DR recovery task enqueued: task_id=%s restore_timestamp=%s buffer_minutes=%d",
+            task.id,
+            restore_timestamp,
+            buffer_minutes,
+        )
+        return JsonResponse(
+            {
+                "task_id": task.id,
+                "status": "enqueued",
+                "restore_timestamp": restore_timestamp,
+                "buffer_minutes": buffer_minutes,
+                "dry_run": dry_run,
+            },
+            status=202,
+        )
+    except Exception:
+        logger.exception("Error enqueuing workspace DR recovery task")
+        return JsonResponse({"detail": "Error enqueuing recovery task"}, status=500)
+
+
+@require_http_methods(["POST"])
+def disaster_recovery_reconcile(request):
+    """Trigger disaster recovery reconciliation for Kessel Relations.
+
+    POST /_private/api/disaster_recovery/reconcile/
+
+    Body: {"restore_timestamp": "2024-01-15T10:30:00Z", "buffer_seconds": 300, "dry_run": false}
+    """
+    if not getattr(settings, "DR_RELATIONS_RECONCILE_ENABLED", False):
+        return JsonResponse({"error": "Disaster recovery reconciliation is not enabled"}, status=403)
+
+    from datetime import datetime
+
+    from management.tasks import run_disaster_recovery_reconcile
+
+    body = load_request_body(request)
+
+    restore_timestamp_str = body.get("restore_timestamp")
+    if not restore_timestamp_str:
+        return JsonResponse({"error": "restore_timestamp is required"}, status=400)
+
+    try:
+        dt = datetime.fromisoformat(restore_timestamp_str.replace("Z", "+00:00"))
+        restore_timestamp_ms = int(dt.timestamp() * 1000)
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "Invalid restore_timestamp format, expected ISO 8601"}, status=400)
+
+    buffer_seconds = body.get("buffer_seconds", 300)
+    if isinstance(buffer_seconds, bool) or not isinstance(buffer_seconds, int) or buffer_seconds < 0:
+        return JsonResponse({"error": "buffer_seconds must be a non-negative integer"}, status=400)
+
+    dry_run = body.get("dry_run", False)
+    if not isinstance(dry_run, bool):
+        return JsonResponse({"error": "dry_run must be a boolean"}, status=400)
+
+    task = run_disaster_recovery_reconcile.delay(
+        restore_timestamp_ms=restore_timestamp_ms,
+        buffer_seconds=buffer_seconds,
+        dry_run=dry_run,
+    )
+
+    return JsonResponse(
+        {
+            "message": "Disaster recovery reconciliation enqueued.",
+            "task_id": str(task.id),
+            "restore_timestamp_ms": restore_timestamp_ms,
+            "buffer_seconds": buffer_seconds,
+            "dry_run": dry_run,
+        },
+        status=202,
+    )
+
+
+def kessel_parity_check(request):
+    """View method for triggering on-demand Kessel-RBAC parity checks.
+
+    POST /_private/api/utils/kessel_parity_check/
+
+    Body: {"org_ids": ["12345", "67890"]}
+
+    Triggers parity checks for the specified org(s) regardless of the
+    PARITY_CHECK_ENABLED setting. The scheduled Celery Beat cron job
+    behavior is unchanged.
+    """
+    if request.method != "POST":
+        return HttpResponse('Invalid method, only "POST" is allowed.', status=405)
+
+    if not request.body:
+        return HttpResponse('Invalid request, must supply "org_ids" in body.', status=400)
+
+    try:
+        body = json.loads(request.body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return HttpResponse("Invalid JSON in request body.", status=400)
+
+    org_ids = body.get("org_ids")
+    if not isinstance(org_ids, list) or len(org_ids) == 0:
+        return HttpResponse(
+            'Invalid request: the "org_ids" array in the body must contain at least one org_id.',
+            status=400,
+        )
+
+    # Validate all entries are non-empty strings
+    for entry in org_ids:
+        if not isinstance(entry, str) or not entry.strip():
+            return HttpResponse(
+                'Invalid request: all entries in "org_ids" must be non-empty strings.',
+                status=400,
+            )
+
+    logger.info("On-demand Kessel parity check requested for org_ids: %s", org_ids)
+    task = run_kessel_parity_checks_in_worker.delay(org_ids=org_ids)
+
+    return JsonResponse(
+        {
+            "message": "Kessel parity check enqueued.",
+            "task_id": str(task.id),
+            "org_ids": org_ids,
+        },
+        status=202,
+    )
+
+
+def bootstrap_users_from_user_ids(request):
+    """Bootstrap users by looking up user IDs in BOP and creating users/tenants.
+
+    POST /_private/api/utils/bootstrap_users_from_user_ids/?dry_run=true
+
+    Body: {"user_ids": ["12345", "67890"]}
+
+    Query params:
+        dry_run: When 'true', queries BOP and reports what would happen without
+                 actually creating users or bootstrapping tenants.
+
+    For each user ID:
+    1. Queries BOP to get user details (username, org_id, is_active, is_org_admin)
+    2. Skips users that are not active
+    3. Creates the user and bootstraps their tenant using the same flow as replicated events
+    """
+    if request.method != "POST":
+        return handle_error('Invalid method, only "POST" is allowed.', 405)
+
+    if not request.body:
+        return handle_error('Invalid request, must supply "user_ids" in body.', 400)
+
+    try:
+        body = json.loads(request.body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as err:
+        return handle_error(f"Invalid JSON in request body: {err}", 400)
+
+    user_ids = body.get("user_ids", [])
+    if not user_ids or not isinstance(user_ids, list):
+        return handle_error('Invalid request: "user_ids" must be a non-empty array.', 400)
+
+    dry_run = request.GET.get("dry_run", "false").lower() == "true"
+    user_ids = [str(uid) for uid in user_ids]
+
+    logger.info("Bootstrap users from user_ids requested. count=%d dry_run=%s", len(user_ids), dry_run)
+
+    resp = PROXY.request_filtered_principals(
+        user_ids,
+        org_id=None,
+        options={"query_by": "user_id", "return_id": True, "status": "all"},
+    )
+
+    if isinstance(resp, dict) and "errors" in resp:
+        bop_status = resp.get("status_code", 500)
+        logger.error("BOP error during bootstrap_users_from_user_ids: status=%s errors=%s", bop_status, resp["errors"])
+        return handle_error(f"Error querying BOP for user IDs: {resp['errors']}", 500)
+
+    bop_users = resp.get("data", [])
+    bop_user_by_id = {}
+    if isinstance(bop_users, dict):
+        bop_users = bop_users.get("users", [])
+    for bop_user in bop_users:
+        uid = bop_user.get("user_id") or bop_user.get("external_source_id")
+        if uid:
+            bop_user_by_id[str(uid)] = bop_user
+
+    results = []
+    bootstrap_service = V2TenantBootstrapService(OutboxReplicator())
+
+    for user_id in user_ids:
+        bop_user = bop_user_by_id.get(user_id)
+        if bop_user is None:
+            results.append({"user_id": user_id, "status": "not_found", "detail": "User not found in BOP"})
+            continue
+
+        user = external_principal_to_user(bop_user)
+        if not user.is_active:
+            results.append(
+                {
+                    "user_id": user_id,
+                    "status": "inactive",
+                    "detail": "User is not active in BOP",
+                    "username": user.username,
+                    "org_id": user.org_id,
+                }
+            )
+            continue
+
+        if not user.org_id:
+            results.append(
+                {
+                    "user_id": user_id,
+                    "status": "error",
+                    "detail": "User has no org_id in BOP",
+                    "username": user.username,
+                }
+            )
+            continue
+
+        if dry_run:
+            results.append(
+                {
+                    "user_id": user_id,
+                    "status": "would_bootstrap",
+                    "username": user.username,
+                    "org_id": user.org_id,
+                    "is_org_admin": user.admin,
+                }
+            )
+            continue
+
+        try:
+            with transaction.atomic():
+                bootstrapped = bootstrap_service.update_user(user, upsert=True, ready_tenant=True)
+            if bootstrapped is None:
+                results.append(
+                    {
+                        "user_id": user_id,
+                        "status": "inactive",
+                        "detail": "User became inactive during bootstrap",
+                        "username": user.username,
+                        "org_id": user.org_id,
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "user_id": user_id,
+                        "status": "bootstrapped",
+                        "username": user.username,
+                        "org_id": user.org_id,
+                        "tenant_ready": bootstrapped.tenant.ready,
+                    }
+                )
+        except Exception as err:
+            logger.exception("Error bootstrapping user_id=%s org_id=%s: %s", user_id, user.org_id, err)
+            results.append(
+                {
+                    "user_id": user_id,
+                    "status": "error",
+                    "detail": str(err),
+                    "username": user.username,
+                    "org_id": user.org_id,
+                }
+            )
+
+    bootstrapped_count = sum(1 for r in results if r["status"] == "bootstrapped")
+    logger.info(
+        "Bootstrap users from user_ids completed. total=%d bootstrapped=%d dry_run=%s",
+        len(user_ids),
+        bootstrapped_count,
+        dry_run,
+    )
+
+    return JsonResponse({"dry_run": dry_run, "results": results}, status=200)

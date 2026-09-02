@@ -16,9 +16,12 @@
 #
 """View for RoleV2 management."""
 
+import logging
+
 from management.atomic_transactions import atomic_block
 from management.audit_log.model import AuditLog
 from management.base_viewsets import BaseV2ViewSet
+from management.notifications.notification_handlers import custom_v2_role_obj_change_notification_handler
 from management.permissions.role_v2_access import RoleV2KesselAccessPermission
 from management.permissions.v2_edit_api_access import V2WriteRequiresWorkspacesEnabled
 from management.role.v2_exceptions import CustomRoleRequiredError, RolesNotFoundError
@@ -31,6 +34,7 @@ from management.role.v2_serializer import (
     validate_fields_parameter,
 )
 from management.role.v2_service import RoleV2Service
+from management.role_binding.serializer import resolve_resource_identifiers
 from management.utils import v2response_error_from_errors
 from management.v2_mixins import AtomicOperationsMixin
 from rest_framework import status
@@ -38,6 +42,8 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 
 from api.common.pagination import V2CursorPagination
+
+logger = logging.getLogger(__name__)
 
 
 class RoleV2CursorPagination(V2CursorPagination):
@@ -61,7 +67,7 @@ class RoleV2ViewSet(AtomicOperationsMixin, BaseV2ViewSet):
     DEFAULT_CREATE_UPDATE_FIELDS = {"id", "name", "description", "permissions", "last_modified"}
 
     def get_queryset(self):
-        """Return assignable roles for the requesting tenant. Restricts writes to custom roles."""
+        """Return assignable roles for the requesting tenant. Restricts creates to custom roles."""
         if self.action == "retrieve":
             fields = RoleV2Service.DEFAULT_RETRIEVE_FIELDS
         else:
@@ -70,6 +76,8 @@ class RoleV2ViewSet(AtomicOperationsMixin, BaseV2ViewSet):
 
         if self.action in ("list", "retrieve"):
             return base_qs.excluding_out_of_scope_v2_roles()
+        if self.action in ("update", "bulk_destroy"):
+            return base_qs
         return base_qs.filter(type=RoleV2.Types.CUSTOM)
 
     def get_serializer_context(self):
@@ -109,6 +117,14 @@ class RoleV2ViewSet(AtomicOperationsMixin, BaseV2ViewSet):
         input_serializer.is_valid(raise_exception=True)
         validated_params = input_serializer.validated_data
 
+        if validated_params.get("resource_tenant_org_id"):
+            resource_type, resource_id = resolve_resource_identifiers(validated_params)
+            validated_params = {
+                **{k: v for k, v in validated_params.items() if k != "resource_tenant_org_id"},
+                "resource_id": resource_id,
+                "resource_type": resource_type,
+            }
+
         service = RoleV2Service(tenant=request.tenant)
         queryset = service.list(validated_params)
 
@@ -131,6 +147,29 @@ class RoleV2ViewSet(AtomicOperationsMixin, BaseV2ViewSet):
             audit_log = AuditLog()
             audit_log.log_create(request=request, resource=AuditLog.ROLE_V2)
 
+        # CREATE operation - SEC-MON-REQ-1 compliance (EOI-1 pii_manipulation)
+        logger.info(
+            "V2 Role created",
+            extra={
+                "action": "CREATE",
+                "resource_type": "role_v2",
+                "resource_id": str(role.uuid),
+                "outcome": "success",
+                "org_id": getattr(request.user, "org_id", None),
+                "username": getattr(request.user, "username", None),
+            },
+        )
+
+        try:
+            custom_v2_role_obj_change_notification_handler(role, "created", request.user)
+        except ValueError:
+            raise
+        except Exception:
+            logger.error(
+                f"Failed to send notification for created role: role pk={role.pk!r}, name={role.name!r}",
+                exc_info=True,
+            )
+
         # Build response with field selection (from context) and permission ordering
         input_permissions = request.data.get("permissions", [])
         context = self.get_serializer_context()
@@ -143,12 +182,38 @@ class RoleV2ViewSet(AtomicOperationsMixin, BaseV2ViewSet):
         with atomic_block():
             instance = self.get_object()
 
+            if instance.type != RoleV2.Types.CUSTOM:
+                raise ValidationError({"uuid": "System roles may not be updated."})
+
             audit_log = AuditLog()
             audit_log.log_edit(request=request, resource=AuditLog.ROLE_V2, object=instance)
 
             serializer = self.get_serializer(instance, data=request.data)
             serializer.is_valid(raise_exception=True)
             role = serializer.save()
+
+        # UPDATE operation - SEC-MON-REQ-1 compliance (EOI-1 pii_manipulation)
+        logger.info(
+            "V2 Role updated",
+            extra={
+                "action": "UPDATE",
+                "resource_type": "role_v2",
+                "resource_id": str(role.uuid),
+                "outcome": "success",
+                "org_id": getattr(request.user, "org_id", None),
+                "username": getattr(request.user, "username", None),
+            },
+        )
+
+        try:
+            custom_v2_role_obj_change_notification_handler(role, "updated", request.user)
+        except ValueError:
+            raise
+        except Exception:
+            logger.error(
+                f"Failed to send notification for updated role: role pk={role.pk!r}, name={role.name!r}",
+                exc_info=True,
+            )
 
         # Build response with field selection (from context) and permission ordering
         input_permissions = request.data.get("permissions", [])
@@ -170,12 +235,47 @@ class RoleV2ViewSet(AtomicOperationsMixin, BaseV2ViewSet):
 
         ids = set(serializer.validated_data["ids"])
 
+        if ids:
+            non_custom = (
+                RoleV2.objects.for_tenant(request.tenant)
+                .assignable()
+                .filter(uuid__in=ids)
+                .exclude(type=RoleV2.Types.CUSTOM)
+            )
+            if non_custom.exists():
+                return Response(
+                    v2response_error_from_errors(
+                        errors=[
+                            {
+                                "detail": "System roles may not be deleted.",
+                                "status": status.HTTP_400_BAD_REQUEST,
+                                "source": "ids",
+                            }
+                        ],
+                    ),
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         try:
             removed_roles = service.bulk_delete(ids, from_tenant=self.request.tenant)
 
             for role in removed_roles:
                 audit_log = AuditLog()
                 audit_log.log_delete(request=request, resource=AuditLog.ROLE_V2, object=role)
+
+            # DELETE operation - SEC-MON-REQ-1 compliance (EOI-1 pii_manipulation)
+            logger.info(
+                "V2 Roles bulk deleted",
+                extra={
+                    "action": "DELETE",
+                    "resource_type": "role_v2",
+                    "resource_id": f"{len(removed_roles)}_roles",
+                    "outcome": "success",
+                    "org_id": getattr(request.user, "org_id", None),
+                    "username": getattr(request.user, "username", None),
+                    "deleted_count": len(removed_roles),
+                },
+            )
         except RolesNotFoundError as e:
             return Response(
                 v2response_error_from_errors(
@@ -184,12 +284,29 @@ class RoleV2ViewSet(AtomicOperationsMixin, BaseV2ViewSet):
                 status=status.HTTP_404_NOT_FOUND,
             )
         except CustomRoleRequiredError as e:
-            # This should be impossible. We constrain deletions to be from the user's tenant. Non-custom roles should
-            # only exist in the public tenant, and there shouldn't be any users in the public tenant. Thus,
-            # we will never find any non-custom roles to try to delete.
             return Response(
-                {"title": "An internal error occurred.", "detail": str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                v2response_error_from_errors(
+                    errors=[
+                        {
+                            "detail": str(e),
+                            "status": status.HTTP_400_BAD_REQUEST,
+                            "source": "ids",
+                        }
+                    ],
+                    exc=e,
+                ),
+                status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # We don't allow a revert here because sending a notification in the middle could fail. This would make it
+        # unclear what to do with all of the earlier notifications that have already been sent.
+        for role in removed_roles:
+            try:
+                custom_v2_role_obj_change_notification_handler(role, "deleted", request.user)
+            except Exception:
+                logger.error(
+                    f"Failed to send notification for deleted role: role pk={role.pk!r}, name={role.name!r}",
+                    exc_info=True,
+                )
 
         return Response(status=status.HTTP_204_NO_CONTENT)

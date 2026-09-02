@@ -46,6 +46,28 @@ class ECSCustomFormatter(StdlibFormatter):
             if isinstance(request, django.core.handlers.wsgi.WSGIRequest):
                 result = self.add_info_from_WSGIRequest(result, request)
 
+        if hasattr(record, "env_name"):
+            result["labels"] = result.get("labels", {})
+            result["labels"]["env"] = record.env_name
+
+        # Inject request context fields as structured ECS labels so that
+        # downstream log aggregation can query them directly.
+        # Only emit when the value is a real identifier (not the "-"
+        # default) to avoid polluting ECS queries with Celery / startup
+        # noise that carries no useful correlation data.
+        if hasattr(record, "request_id") and record.request_id != "-":
+            result["labels"] = result.get("labels", {})
+            result["labels"]["request_id"] = record.request_id
+        if hasattr(record, "org_id") and record.org_id != "-":
+            result["labels"] = result.get("labels", {})
+            result["labels"]["org_id"] = record.org_id
+        if hasattr(record, "user_id") and record.user_id != "-":
+            result.setdefault("user", {})
+            result["user"]["id"] = record.user_id
+        if hasattr(record, "user_type") and record.user_type != "-":
+            result["labels"] = result.get("labels", {})
+            result["labels"]["user_type"] = record.user_type
+
         # Remove some field not following standard:
         # https://www.elastic.co/guide/en/ecs/1.6/ecs-field-reference.html
         result.pop("message", None)

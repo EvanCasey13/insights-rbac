@@ -43,6 +43,15 @@ objects:
           ignore-check.kube-linter.io/minimum-three-replicas: "dont need 3 replicas - runs background processes from turnpike/weekly tasks"
       podSpec:
         image: ${IMAGE}:${IMAGE_TAG}
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          seccompProfile:
+            type: RuntimeDefault
+          capabilities:
+            drop:
+              - ALL
         initContainers:
           - env:
             inheritEnv: true
@@ -88,6 +97,8 @@ objects:
           successThreshold: 1
           timeoutSeconds: 10
         volumeMounts:
+        - mountPath: /tmp
+          name: tmp
         - mountPath: /opt/rbac/rbac/management/role/definitions
           name: default-role-config
         - mountPath: /opt/rbac/rbac/management/role/permissions
@@ -105,6 +116,8 @@ objects:
           secret:
             optional: true
             secretName: it-umb-key-pair
+        - name: tmp
+          emptyDir: {}
         resources:
           limits:
             cpu: ${CELERY_WORKER_CPU_LIMIT}
@@ -209,6 +222,16 @@ objects:
             value: ${NOTIFICATIONS_RH_ENABLED}
           - name: KAFKA_ENABLED
             value: ${KAFKA_ENABLED}
+          - name: DR_RELATIONS_RECONCILE_ENABLED
+            value: ${DR_RELATIONS_RECONCILE_ENABLED}
+          - name: DR_WORKSPACE_RECONCILE_ENABLED
+            value: ${DR_WORKSPACE_RECONCILE_ENABLED}
+          - name: RBAC_KAFKA_CONSUMER_TOPIC
+            value: ${RBAC_KAFKA_CONSUMER_TOPIC}
+          - name: DR_KAFKA_CONSUMER_GROUP_ID
+            value: ${DR_KAFKA_CONSUMER_GROUP_ID}
+          - name: CELERY_WORKER_CONCURRENCY
+            value: ${CELERY_WORKER_CONCURRENCY}
           - name: NOTIFICATIONS_TOPIC
             value: ${NOTIFICATIONS_TOPIC}
           - name: EXTERNAL_SYNC_TOPIC
@@ -243,10 +266,20 @@ objects:
             value: ${REDHAT_SSO}
           - name: REPLICATION_TO_RELATION_ENABLED
             value: ${REPLICATION_TO_RELATION_ENABLED}
+          - name: EPH_ENV
+            value: ${EPH_ENV}
           - name: PRINCIPAL_CLEANUP_UPDATE_ENABLED_UMB
             value: ${PRINCIPAL_CLEANUP_UPDATE_ENABLED_UMB}
+          - name: PRINCIPAL_CLEANUP_UPDATE_ENABLED_KAFKA
+            value: ${PRINCIPAL_CLEANUP_UPDATE_ENABLED_KAFKA}
+          - name: KAFKA_PRINCIPAL_CLEANUP_TOPIC
+            value: ${KAFKA_PRINCIPAL_CLEANUP_TOPIC}
+          - name: KAFKA_PRINCIPAL_CLEANUP_DLQ_TOPIC
+            value: ${KAFKA_PRINCIPAL_CLEANUP_DLQ_TOPIC}
           - name: V2_MIGRATION_APP_EXCLUDE_LIST
             value: ${V2_MIGRATION_APP_EXCLUDE_LIST}
+          - name: V2_STRICT_ACCESS_CHECK_FLAG_APPLICATION_NAMES
+            value: ${V2_STRICT_ACCESS_CHECK_FLAG_APPLICATION_NAMES}
           - name: V2_BOOTSTRAP_TENANT
             value: ${V2_BOOTSTRAP_TENANT}
           - name: WORKSPACE_APPLICATION_NAME
@@ -265,6 +298,10 @@ objects:
             value: ${WORKSPACE_RESTRICT_DEFAULT_PEERS}
           - name: FEATURE_FLAGS_CACHE_DIR
             value: ${FEATURE_FLAGS_CACHE_DIR}
+          - name: UNLEASH_REFRESH_INTERVAL
+            value: ${UNLEASH_REFRESH_INTERVAL}
+          - name: UNLEASH_REQUEST_TIMEOUT
+            value: ${UNLEASH_REQUEST_TIMEOUT}
           - name: SYSTEM_DEFAULT_ROOT_WORKSPACE_ROLE_UUID
             value: ${SYSTEM_DEFAULT_ROOT_WORKSPACE_ROLE_UUID}
           - name: SYSTEM_ADMIN_ROOT_WORKSPACE_ROLE_UUID
@@ -279,14 +316,33 @@ objects:
             value: ${TENANT_SCOPE_PERMISSIONS}
           - name: DEFAULT_SCOPE_PERMISSIONS
             value: ${DEFAULT_SCOPE_PERMISSIONS}
+          - name: AUTOMATIC_SCOPE_MIGRATION_ENABLED
+            value: ${AUTOMATIC_SCOPE_MIGRATION_ENABLED}
           ####### Following envs are for scheduler, doesn't hurt to put in worker
           - name: PRINCIPAL_CLEANUP_DELETION_ENABLED_UMB
             value: ${PRINCIPAL_CLEANUP_DELETION_ENABLED_UMB}
           - name: UMB_JOB_ENABLED
             value: ${UMB_JOB_ENABLED}
+          - name: PARITY_CHECK_ENABLED
+            value: ${PARITY_CHECK_ENABLED}
+          - name: PARITY_CHECK_ORG_IDS
+            value: ${PARITY_CHECK_ORG_IDS}
+          - name: PARITY_CHECK_SCHEDULE
+            value: ${PARITY_CHECK_SCHEDULE}
+          - name: PRINCIPAL_CLEANUP_DELETION_ENABLED_KAFKA
+            value: ${PRINCIPAL_CLEANUP_DELETION_ENABLED_KAFKA}
+          - name: KAFKA_PRINCIPAL_CLEANUP_JOB_ENABLED
+            value: ${KAFKA_PRINCIPAL_CLEANUP_JOB_ENABLED}
           - name: READ_ONLY_API_MODE
             value: ${READ_ONLY_API_MODE}
-
+          - name: PARITY_CHECK_ENABLED
+            value: ${PARITY_CHECK_ENABLED}
+          - name: PARITY_CHECK_INTERVAL_SECONDS
+            value: ${PARITY_CHECK_INTERVAL_SECONDS}
+          - name: PARITY_CHECK_TENANT_SAMPLE_SIZE
+            value: ${PARITY_CHECK_TENANT_SAMPLE_SIZE}
+          - name: PARITY_CHECK_PRINCIPAL_SAMPLE_SIZE
+            value: ${PARITY_CHECK_PRINCIPAL_SAMPLE_SIZE}
     - name: scheduler-service
       minReplicas: ${{MIN_SCHEDULER_REPLICAS}}
       metadata:
@@ -294,6 +350,15 @@ objects:
           ignore-check.kube-linter.io/minimum-three-replicas: "dont need 3 replicas - keeps the cron scheduled for the weekly tasks"
       podSpec:
         image: ${IMAGE}:${IMAGE_TAG}
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          seccompProfile:
+            type: RuntimeDefault
+          capabilities:
+            drop:
+              - ALL
         command:
           - /bin/bash
           - '-c'
@@ -312,7 +377,7 @@ objects:
           initialDelaySeconds: ${{CELERY_INITIAL_DELAY_SEC}}
           periodSeconds: ${{CELERY_PERIOD_SEC}}
           successThreshold: 1
-          timeoutSeconds: 10
+          timeoutSeconds: 20
         readinessProbe:
           exec:
             command:
@@ -324,7 +389,7 @@ objects:
           failureThreshold: 3
           periodSeconds: ${{CELERY_PERIOD_SEC}}
           successThreshold: 1
-          timeoutSeconds: 10
+          timeoutSeconds: 20
         resources:
           limits:
             cpu: ${CELERY_SCHEDULER_CPU_LIMIT}
@@ -332,6 +397,12 @@ objects:
           requests:
             cpu: ${CELERY_SCHEDULER_CPU_REQUEST}
             memory: ${CELERY_SCHEDULER_MEMORY_REQUEST}
+        volumeMounts:
+        - mountPath: /tmp
+          name: tmp
+        volumes:
+        - name: tmp
+          emptyDir: {}
         env: *common_env_vars
 
     - name: service
@@ -342,6 +413,15 @@ objects:
           apiPath: rbac
       podSpec:
         image: ${IMAGE}:${IMAGE_TAG}
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          seccompProfile:
+            type: RuntimeDefault
+          capabilities:
+            drop:
+              - ALL
         initContainers:
           - env:
             inheritEnv: true
@@ -350,7 +430,7 @@ objects:
               - /opt/rbac/deploy/init-container-setup.sh
         livenessProbe:
           httpGet:
-            path: /api/rbac/v1/status/
+            path: /
             port: 8000
             scheme: HTTP
           initialDelaySeconds: 60
@@ -375,7 +455,11 @@ objects:
         - configMap:
             name: ${MODEL_ACCESS_PERMISSIONS}
           name: model-access-permissions
+        - name: tmp
+          emptyDir: {}
         volumeMounts:
+        - mountPath: /tmp
+          name: tmp
         - mountPath: /opt/rbac/rbac/management/role/definitions
           name: default-role-config
         - mountPath: /opt/rbac/rbac/management/role/permissions
@@ -520,6 +604,12 @@ objects:
             value: ${NOTIFICATIONS_RH_ENABLED}
           - name: KAFKA_ENABLED
             value: ${KAFKA_ENABLED}
+          - name: DR_RELATIONS_RECONCILE_ENABLED
+            value: ${DR_RELATIONS_RECONCILE_ENABLED}
+          - name: DR_WORKSPACE_RECONCILE_ENABLED
+            value: ${DR_WORKSPACE_RECONCILE_ENABLED}
+          - name: CELERY_WORKER_CONCURRENCY
+            value: ${CELERY_WORKER_CONCURRENCY}
           - name: NOTIFICATIONS_TOPIC
             value: ${NOTIFICATIONS_TOPIC}
           - name: EXTERNAL_SYNC_TOPIC
@@ -536,10 +626,16 @@ objects:
             value: ${SA_NAME}
           - name: REPLICATION_TO_RELATION_ENABLED
             value: ${REPLICATION_TO_RELATION_ENABLED}
+          - name: EPH_ENV
+            value: ${EPH_ENV}
           - name: PRINCIPAL_CLEANUP_UPDATE_ENABLED_UMB
             value: ${PRINCIPAL_CLEANUP_UPDATE_ENABLED_UMB}
+          - name: PRINCIPAL_CLEANUP_UPDATE_ENABLED_KAFKA
+            value: ${PRINCIPAL_CLEANUP_UPDATE_ENABLED_KAFKA}
           - name: V2_MIGRATION_APP_EXCLUDE_LIST
             value: ${V2_MIGRATION_APP_EXCLUDE_LIST}
+          - name: V2_STRICT_ACCESS_CHECK_FLAG_APPLICATION_NAMES
+            value: ${V2_STRICT_ACCESS_CHECK_FLAG_APPLICATION_NAMES}
           - name: V2_BOOTSTRAP_TENANT
             value: ${V2_BOOTSTRAP_TENANT}
           - name: WORKSPACE_APPLICATION_NAME
@@ -560,6 +656,10 @@ objects:
             value: ${READ_YOUR_WRITES_TIMEOUT_SECONDS}
           - name: FEATURE_FLAGS_CACHE_DIR
             value: ${FEATURE_FLAGS_CACHE_DIR}
+          - name: UNLEASH_REFRESH_INTERVAL
+            value: ${UNLEASH_REFRESH_INTERVAL}
+          - name: UNLEASH_REQUEST_TIMEOUT
+            value: ${UNLEASH_REQUEST_TIMEOUT}
           - name: SYSTEM_DEFAULT_ROOT_WORKSPACE_ROLE_UUID
             value: ${SYSTEM_DEFAULT_ROOT_WORKSPACE_ROLE_UUID}
           - name: SYSTEM_ADMIN_ROOT_WORKSPACE_ROLE_UUID
@@ -574,6 +674,8 @@ objects:
             value: ${TENANT_SCOPE_PERMISSIONS}
           - name: DEFAULT_SCOPE_PERMISSIONS
             value: ${DEFAULT_SCOPE_PERMISSIONS}
+          - name: AUTOMATIC_SCOPE_MIGRATION_ENABLED
+            value: ${AUTOMATIC_SCOPE_MIGRATION_ENABLED}
           - name: WORKSPACE_ACCESS_TIMING_ENABLED
             value: ${WORKSPACE_ACCESS_TIMING_ENABLED}
           - name: RBAC_KAFKA_CONSUMER_TOPIC
@@ -644,6 +746,8 @@ objects:
             value: ${IT_BYPASS_PERMISSIONS_MODIFY_SERVICE_ACCOUNTS}
           - name: IT_BYPASS_TOKEN_VALIDATION
             value: ${IT_BYPASS_TOKEN_VALIDATION}
+          - name: IT_BYPASS_SYSTEM_USER_ID
+            value: ${IT_BYPASS_SYSTEM_USER_ID}
           - name: IT_SERVICE_BASE_PATH
             value: ${IT_SERVICE_BASE_PATH}
           - name: IT_SERVICE_HOST
@@ -652,16 +756,22 @@ objects:
             value: ${IT_SERVICE_PORT}
           - name: IT_SERVICE_PROTOCOL_SCHEME
             value: ${IT_SERVICE_PROTOCOL_SCHEME}
+          - name: IT_SERVICE_REALM
+            value: ${IT_SERVICE_REALM}
           - name: IT_SERVICE_TIMEOUT_SECONDS
             value: ${IT_SERVICE_TIMEOUT_SECONDS}
           - name: IT_TOKEN_JKWS_CACHE_LIFETIME
             value: ${IT_TOKEN_JKWS_CACHE_LIFETIME}
+          - name: MCP_ENABLED
+            value: ${MCP_ENABLED}
           - name: V2_APIS_ENABLED
             value: ${V2_APIS_ENABLED}
           - name: V2_READ_ONLY_API_MODE
             value: ${V2_READ_ONLY_API_MODE}
           - name: V2_EDIT_API_ENABLED
             value: ${V2_EDIT_API_ENABLED}
+          - name: KESSEL_TENANT_AUTH_ENABLED
+            value: ${KESSEL_TENANT_AUTH_ENABLED}
           - name: V1_ROLE_PERMISSION_BLOCK_LIST
             value: ${V1_ROLE_PERMISSION_BLOCK_LIST}
           - name: READ_ONLY_API_MODE
@@ -670,6 +780,8 @@ objects:
             value: ${ADD_UNGROUPED_HOSTS_ID}
           - name: REMOVE_NULL_VALUE
             value: ${REMOVE_NULL_VALUE}
+          - name: MCP_WRITE_ENABLED
+            value: ${MCP_WRITE_ENABLED}
           - name: SYSTEM_DEFAULT_ROOT_WORKSPACE_ROLE_UUID
             value: ${SYSTEM_DEFAULT_ROOT_WORKSPACE_ROLE_UUID}
           - name: SYSTEM_ADMIN_ROOT_WORKSPACE_ROLE_UUID
@@ -684,6 +796,16 @@ objects:
             value: ${TENANT_SCOPE_PERMISSIONS}
           - name: DEFAULT_SCOPE_PERMISSIONS
             value: ${DEFAULT_SCOPE_PERMISSIONS}
+          - name: AUTOMATIC_SCOPE_MIGRATION_ENABLED
+            value: ${AUTOMATIC_SCOPE_MIGRATION_ENABLED}
+          - name: PARITY_CHECK_ENABLED
+            value: ${PARITY_CHECK_ENABLED}
+          - name: PARITY_CHECK_INTERVAL_SECONDS
+            value: ${PARITY_CHECK_INTERVAL_SECONDS}
+          - name: PARITY_CHECK_TENANT_SAMPLE_SIZE
+            value: ${PARITY_CHECK_TENANT_SAMPLE_SIZE}
+          - name: PARITY_CHECK_PRINCIPAL_SAMPLE_SIZE
+            value: ${PARITY_CHECK_PRINCIPAL_SAMPLE_SIZE}
 
     - name: rbac-kafka-consumer
       minReplicas: ${{RBAC_KAFKA_CONSUMER_REPLICAS}}
@@ -693,6 +815,15 @@ objects:
           ignore-check.kube-linter.io/minimum-three-replicas: "A single consumer guarantees events are processed in the exact order they happened, maintaining the integrity and consistency."
       podSpec:
         image: ${IMAGE}:${IMAGE_TAG}
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          seccompProfile:
+            type: RuntimeDefault
+          capabilities:
+            drop:
+              - ALL
         command: ["/opt/rbac/rbac/manage.py", "launch-rbac-kafka-consumer"]
         env:
           - name: APP_NAMESPACE
@@ -740,8 +871,14 @@ objects:
             value: ${RBAC_KAFKA_CONSUMER_GROUP_ID}
           - name: RBAC_KAFKA_CUSTOM_CONSUMER_BROKER
             value: ${RBAC_KAFKA_CUSTOM_CONSUMER_BROKER}
+          - name: KAFKA_PRINCIPAL_CLEANUP_TOPIC
+            value: ${KAFKA_PRINCIPAL_CLEANUP_TOPIC}
+          - name: KAFKA_PRINCIPAL_CLEANUP_DLQ_TOPIC
+            value: ${KAFKA_PRINCIPAL_CLEANUP_DLQ_TOPIC}
           - name: REPLICATION_TO_RELATION_ENABLED
             value: ${REPLICATION_TO_RELATION_ENABLED}
+          - name: EPH_ENV
+            value: ${EPH_ENV}
           - name: RELATION_API_SERVER
             value: ${RELATION_API_SERVER}
           # Relations API variables
@@ -771,6 +908,8 @@ objects:
             value: ${TENANT_SCOPE_PERMISSIONS}
           - name: DEFAULT_SCOPE_PERMISSIONS
             value: ${DEFAULT_SCOPE_PERMISSIONS}
+          - name: AUTOMATIC_SCOPE_MIGRATION_ENABLED
+            value: ${AUTOMATIC_SCOPE_MIGRATION_ENABLED}
           - name: REDHAT_SSO
             value: ${REDHAT_SSO}
         livenessProbe:
@@ -796,6 +935,71 @@ objects:
           requests:
             cpu: ${RBAC_KAFKA_CONSUMER_CPU_REQUEST}
             memory: ${RBAC_KAFKA_CONSUMER_MEMORY_REQUEST}
+        volumeMounts:
+        - mountPath: /tmp
+          name: tmp
+        volumes:
+        - name: tmp
+          emptyDir: {}
+
+    - name: rbac-postgres-exporter
+      minReplicas: ${{MIN_POSTGRES_EXPORTER_REPLICAS}}
+      podSpec:
+        image: ${POSTGRES_EXPORTER_IMAGE}
+        args:
+        - "--extend.query-path=/etc/config.yaml"
+        env:
+        - name: DATABASE_HOST
+          valueFrom:
+            secretKeyRef:
+              key: host
+              name: db-clone
+              optional: false
+        - name: DATABASE_PORT
+          valueFrom:
+            secretKeyRef:
+              key: port
+              name: db-clone
+              optional: false
+        - name: DATABASE_NAME
+          valueFrom:
+            secretKeyRef:
+              key: db
+              name: db-clone
+              optional: false
+        - name: DATA_SOURCE_URI
+          value: "$(DATABASE_HOST):$(DATABASE_PORT)/$(DATABASE_NAME)?sslmode=${PGSSLMODE}"
+        - name: DATA_SOURCE_USER
+          valueFrom:
+            secretKeyRef:
+              key: user
+              name: db-clone
+              optional: false
+        - name: DATA_SOURCE_PASS
+          valueFrom:
+            secretKeyRef:
+              key: pass
+              name: db-clone
+              optional: false
+        volumes:
+        - name: postgres-exporter-queries
+          configMap:
+            name: rbac-postgres-exporter-queries
+            optional: true
+        volumeMounts:
+        - name: postgres-exporter-queries
+          mountPath: /etc/config.yaml
+          subPath: queries.yaml
+        resources:
+          requests:
+            cpu: ${POSTGRES_EXPORTER_CPU_REQUEST}
+            memory: ${POSTGRES_EXPORTER_MEMORY_REQUEST}
+          limits:
+            cpu: ${POSTGRES_EXPORTER_CPU_LIMIT}
+            memory: ${POSTGRES_EXPORTER_MEMORY_LIMIT}
+      webServices:
+        metrics:
+          enabled: true
 
     jobs:
       - name: user-id-populator
@@ -921,8 +1125,12 @@ objects:
               value: ${SA_NAME}
             - name: PRINCIPAL_CLEANUP_UPDATE_ENABLED_UMB
               value: ${PRINCIPAL_CLEANUP_UPDATE_ENABLED_UMB}
+            - name: PRINCIPAL_CLEANUP_UPDATE_ENABLED_KAFKA
+              value: ${PRINCIPAL_CLEANUP_UPDATE_ENABLED_KAFKA}
             - name: V2_MIGRATION_APP_EXCLUDE_LIST
               value: ${V2_MIGRATION_APP_EXCLUDE_LIST}
+            - name: V2_STRICT_ACCESS_CHECK_FLAG_APPLICATION_NAMES
+              value: ${V2_STRICT_ACCESS_CHECK_FLAG_APPLICATION_NAMES}
             - name: V2_BOOTSTRAP_TENANT
               value: ${V2_BOOTSTRAP_TENANT}
             - name: WORKSPACE_APPLICATION_NAME
@@ -941,6 +1149,10 @@ objects:
               value: ${WORKSPACE_ORG_CREATION_LIMIT}
             - name: FEATURE_FLAGS_CACHE_DIR
               value: ${FEATURE_FLAGS_CACHE_DIR}
+            - name: UNLEASH_REFRESH_INTERVAL
+              value: ${UNLEASH_REFRESH_INTERVAL}
+            - name: UNLEASH_REQUEST_TIMEOUT
+              value: ${UNLEASH_REQUEST_TIMEOUT}
             ######## Following envs are different from worker
             - name: S3_AWS_ACCESS_KEY_ID
               valueFrom:
@@ -1142,8 +1354,12 @@ objects:
               value: ${SA_NAME}
             - name: PRINCIPAL_CLEANUP_UPDATE_ENABLED_UMB
               value: ${PRINCIPAL_CLEANUP_UPDATE_ENABLED_UMB}
+            - name: PRINCIPAL_CLEANUP_UPDATE_ENABLED_KAFKA
+              value: ${PRINCIPAL_CLEANUP_UPDATE_ENABLED_KAFKA}
             - name: V2_MIGRATION_APP_EXCLUDE_LIST
               value: ${V2_MIGRATION_APP_EXCLUDE_LIST}
+            - name: V2_STRICT_ACCESS_CHECK_FLAG_APPLICATION_NAMES
+              value: ${V2_STRICT_ACCESS_CHECK_FLAG_APPLICATION_NAMES}
             - name: V2_BOOTSTRAP_TENANT
               value: ${V2_BOOTSTRAP_TENANT}
             - name: WORKSPACE_APPLICATION_NAME
@@ -1162,6 +1378,10 @@ objects:
               value: ${WORKSPACE_ORG_CREATION_LIMIT}
             - name: FEATURE_FLAGS_CACHE_DIR
               value: ${FEATURE_FLAGS_CACHE_DIR}
+            - name: UNLEASH_REFRESH_INTERVAL
+              value: ${UNLEASH_REFRESH_INTERVAL}
+            - name: UNLEASH_REQUEST_TIMEOUT
+              value: ${UNLEASH_REQUEST_TIMEOUT}
             - name: SYSTEM_DEFAULT_ROOT_WORKSPACE_ROLE_UUID
               value: ${SYSTEM_DEFAULT_ROOT_WORKSPACE_ROLE_UUID}
             - name: SYSTEM_ADMIN_ROOT_WORKSPACE_ROLE_UUID
@@ -1176,6 +1396,8 @@ objects:
               value: ${TENANT_SCOPE_PERMISSIONS}
             - name: DEFAULT_SCOPE_PERMISSIONS
               value: ${DEFAULT_SCOPE_PERMISSIONS}
+            - name: AUTOMATIC_SCOPE_MIGRATION_ENABLED
+              value: ${AUTOMATIC_SCOPE_MIGRATION_ENABLED}
             ######## Following envs are different from worker
             - name: S3_AWS_ACCESS_KEY_ID
               valueFrom:
@@ -1238,6 +1460,52 @@ objects:
               cpu: 50m
               memory: 512Mi
           env: *common_env_vars
+      - name: remove-legacy-root-workspace-tenant-parent
+        podSpec:
+          image: ${IMAGE}:${IMAGE_TAG}
+          command:
+            - /opt/rbac/rbac/manage.py
+            - remove_legacy_root_workspace_tenant_parent_relations
+            - "--all"
+          resources:
+            limits:
+              cpu: 300m
+              memory: 1Gi
+            requests:
+              cpu: 50m
+              memory: 512Mi
+          env: *common_env_vars
+      - name: replicate-default-workspaces
+        podSpec:
+          image: ${IMAGE}:${IMAGE_TAG}
+          command:
+            - /opt/rbac/rbac/manage.py
+            - replicate_default_workspaces
+            - "--all"
+          resources:
+            limits:
+              cpu: 300m
+              memory: 1Gi
+            requests:
+              cpu: 50m
+              memory: 512Mi
+          env: *common_env_vars
+      - name: replicate-root-workspace-tenants
+        podSpec:
+          image: ${IMAGE}:${IMAGE_TAG}
+          command:
+            - /opt/rbac/rbac/manage.py
+            - replicate_root_workspace_tenants
+            - "--all"
+            - "--sleep-sec=0.5"
+          resources:
+            limits:
+              cpu: 300m
+              memory: 1Gi
+            requests:
+              cpu: 50m
+              memory: 512Mi
+          env: *common_env_vars
 - apiVersion: v1
   kind: ConfigMap
   metadata:
@@ -1277,7 +1545,7 @@ objects:
     name: system-users
   data:
     system-users.json: >-
-      ewogICAgImluc2VydF9zdWJfaGVyZSI6IHsKICAgICAgICAiYWRtaW4iOiB0cnVlLAogICAgICAgICJpc19zZXJ2aWNlX2FjY291bnQiOiB0cnVlLAogICAgICAgICJhbGxvd19hbnlfb3JnIjogdHJ1ZQogICAgfQp9Cg==
+      ewogICAgIm1vY2tlZC11c2VyLWlkLWJlY2F1c2UtdG9rZW4tdmFsaWRhdGlvbi1pcy1kaXNhYmxlZCI6IHsKICAgICAgICAiYWRtaW4iOiB0cnVlLAogICAgICAgICJpc19zZXJ2aWNlX2FjY291bnQiOiB0cnVlLAogICAgICAgICJhbGxvd19hbnlfb3JnIjogdHJ1ZQogICAgfQp9Cg==
   type: Opaque
 - apiVersion: v1
   kind: Secret
@@ -1326,6 +1594,20 @@ objects:
       requests:
         storage: 2Gi
 
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: rbac-postgres-exporter
+    labels:
+      app: rbac-postgres-exporter
+  spec:
+    ports:
+    - name: 9187-tcp
+      port: 9187
+      targetPort: 9187
+    selector:
+      pod: rbac-postgres-exporter
+    type: ClusterIP
 parameters:
 - description: Image name
   name: IMAGE
@@ -1436,6 +1718,9 @@ parameters:
 - description: Comma-separated apps excluded from v2 migration; same list filters the v2 roles list API only
   name: V2_MIGRATION_APP_EXCLUDE_LIST
   value: ansible,automation-analytics,cost-management,hybrid-committed-spend,idmsvc,ocm,ocp-advisor,policies,sources
+- description: Comma-separated list of apps required to use V2 access checks when the strict access checks flag is enabled.
+  name: V2_STRICT_ACCESS_CHECK_FLAG_APPLICATION_NAMES
+  value: inventory
 - description: Whether or not to bootstrap tenants using V2 logic (i.e. creating workspaces and relations).
   name: V2_BOOTSTRAP_TENANT
   value: 'True'
@@ -1487,6 +1772,10 @@ parameters:
   displayName: Memory Limit
   name: CELERY_WORKER_MEMORY_LIMIT
   value: 512Mi
+- description: Number of concurrent Celery worker processes. 0 uses Celery default (CPU count).
+  displayName: Celery Worker Concurrency
+  name: CELERY_WORKER_CONCURRENCY
+  value: "0"
 - description: Initial amount of CPU the init worker container will request.
   displayName: RBAC worker init container CPU Resource Request
   name: INIT_WORKER_CPU_REQUEST
@@ -1551,10 +1840,6 @@ parameters:
 - description: Enable sending out notification events (typo variant used by service deployer)
   name: NOTIFICATONS_ENABLED
   value: 'False'
-- name: TENANT_TRANSLATOR_HOST
-  required: true
-- name: TENANT_TRANSLATOR_PORT
-  value: '8892'
 - name: GUNICORN_WORKER_MULTIPLIER
   value: '2'
 - name: GUNICORN_THREAD_LIMIT
@@ -1564,6 +1849,18 @@ parameters:
 - description: Enable kafka
   name: KAFKA_ENABLED
   value: 'False'
+- description: Enable disaster recovery reconciliation endpoint and Celery task
+  name: DR_RELATIONS_RECONCILE_ENABLED
+  value: 'False'
+- description: Enable disaster recovery workspace recovery endpoint and Celery task
+  name: DR_WORKSPACE_RECONCILE_ENABLED
+  value: 'False'
+- description: Kafka consumer group ID for DR reconciliation reader
+  name: DR_KAFKA_CONSUMER_GROUP_ID
+  value: 'rbac-dr-consumer-group'
+- description: Comma-separated replication event types to skip during DR reconciliation (empty to skip none)
+  name: DR_SKIP_EVENT_TYPES
+  value: 'bootstrap_tenant,bulk_bootstrap_tenant,external_user_update,external_user_disable,bulk_external_user_update'
 - name: EXTERNAL_SYNC_TOPIC
   value: 'platform.rbac.sync'
 - name: EXTERNAL_CHROME_TOPIC
@@ -1585,6 +1882,11 @@ parameters:
 - name: IT_BYPASS_TOKEN_VALIDATION
   description: Bypass validating the token that the user must provide in the Authorization header for making IT calls?
   value: 'False'
+- name: IT_BYPASS_SYSTEM_USER_ID
+  description: >
+    System user ID used when IT_BYPASS_TOKEN_VALIDATION is enabled.
+    Must match a key in the SYSTEM_USERS secret for s2s auth to succeed.
+  value: 'mocked-user-id-because-token-validation-is-disabled'
 - name: IT_SERVICE_BASE_PATH
   description: Path of the IT service's API
   value: '/auth/realms/redhat-external/apis'
@@ -1597,6 +1899,9 @@ parameters:
 - name: IT_SERVICE_PROTOCOL_SCHEME
   description: Protocol scheme of the IT service
   value: 'https'
+- name: IT_SERVICE_REALM
+  description: Realm path of the IT service (used to build the OIDC discovery URL and token issuer)
+  value: '/auth/realms/redhat-external'
 - name: IT_SERVICE_TIMEOUT_SECONDS
   description: Number of seconds to wait for a response from IT before timing out and failing the request
   value: '10'
@@ -1612,12 +1917,18 @@ parameters:
   value: 'redhat'
 - name: PRINCIPAL_CLEANUP_DELETION_ENABLED_UMB
   description: Allow cleanup job to delete principals via messages from UMB
+- name: PRINCIPAL_CLEANUP_DELETION_ENABLED_KAFKA
+  description: Allow cleanup job to delete principals via messages from Kafka
   value: 'False'
 - name: PRINCIPAL_CLEANUP_UPDATE_ENABLED_UMB
   description: Allow cleanup job to update principals via messages from UMB
+- name: PRINCIPAL_CLEANUP_UPDATE_ENABLED_KAFKA
+  description: Allow cleanup job to update principals via messages from Kafka
   value: 'False'
 - name: UMB_JOB_ENABLED
   description: Temp env to enable the UMB job
+- name: KAFKA_PRINCIPAL_CLEANUP_JOB_ENABLED
+  description: Enable the Kafka-based principal cleanup job
   value: 'True'
 - name: UMB_HOST
   description: Host of the UMB service
@@ -1625,6 +1936,15 @@ parameters:
 - name: UMB_PORT
   description: Port of the UMB service
   value: '61612'
+- name: PARITY_CHECK_ENABLED
+  description: Enable Kessel-RBAC parity checks background job
+  value: 'False'
+- name: PARITY_CHECK_ORG_IDS
+  description: Comma-separated list of org_ids for parity checks
+  value: ''
+- name: PARITY_CHECK_SCHEDULE
+  description: Cron expression for parity check schedule (minute hour day_of_month month_of_year day_of_week)
+  value: '0 0 * * *'
 - name: SA_NAME
   description: Name of the rbac service account
   value: 'nonprod-hcc-rbac'
@@ -1643,6 +1963,12 @@ parameters:
 - name: REPLICATION_TO_RELATION_ENABLED
   description: Enable replication to Relation API
   value: "True"
+- name: EPH_ENV
+  description: Flag indicating deployment is in an ephemeral environment
+  value: 'False'
+- name: MCP_ENABLED
+  description: Flag to enable the MCP (Model Context Protocol) agent-to-service endpoint. Set to False to fully disable the MCP server.
+  value: 'False'
 - name: V2_APIS_ENABLED
   description: Flag to explicitly enable v2 API endpoints
   value: 'True'
@@ -1651,6 +1977,9 @@ parameters:
   value: 'False'
 - name: V2_EDIT_API_ENABLED
   description: Fallback for feature flag to enable v2 edit APIs and block v1 write APIs per org
+  value: 'False'
+- name: KESSEL_TENANT_AUTH_ENABLED
+  description: Route tenant-level role binding access checks through Kessel instead of org-admin middleware
   value: 'False'
 - name: V1_ROLE_PERMISSION_BLOCK_LIST
   description: Comma-separated list of exact permission strings to hide from v1 API (e.g., rbac:role:read,rbac:group:write)
@@ -1691,6 +2020,9 @@ parameters:
 - name: REMOVE_NULL_VALUE
   description: Remove null value from the list of workspace id
   value: 'False'
+- name: MCP_WRITE_ENABLED
+  description: Enable MCP write tools (create groups, roles, etc). Disabled by default for read-only MCP deployments.
+  value: 'False'
 - name: WORKSPACE_ORG_CREATION_LIMIT
   description: The limit of workspaces for all organizations
   value: '3000'
@@ -1727,6 +2059,12 @@ parameters:
 - name: FEATURE_FLAGS_CACHE_DIR
   description: The cache dir for unleash
   value: '/tmp/unleash_cache'
+- name: UNLEASH_REFRESH_INTERVAL
+  description: Unleash feature flag polling interval in seconds
+  value: '30'
+- name: UNLEASH_REQUEST_TIMEOUT
+  description: Unleash HTTP request timeout in seconds
+  value: '30'
 - name: RBAC_KAFKA_CONSUMER_CPU_LIMIT
   description:
   value: 500m
@@ -1751,6 +2089,12 @@ parameters:
 - name: RBAC_KAFKA_CUSTOM_CONSUMER_BROKER
   description: Custom Kafka broker URL for the RBAC Kafka consumer (if empty, uses default Clowder/localhost configuration)
   value: ''
+- name: KAFKA_PRINCIPAL_CLEANUP_TOPIC
+  description: Kafka topic name for principal cleanup events. REQUIRED when PRINCIPAL_CLEANUP_DELETION_ENABLED_KAFKA=true (deployment will fail if not set).
+  value: ''
+- name: KAFKA_PRINCIPAL_CLEANUP_DLQ_TOPIC
+  description: Kafka Dead Letter Queue topic for failed principal cleanup messages (optional, prevents infinite retry loops)
+  value: ''
 - name: ROOT_SCOPE_PERMISSIONS
   description: Comma-separated list of permissions that bind to root workspace scope (supports wildcards like rbac:*:read)
   value: ''
@@ -1760,6 +2104,42 @@ parameters:
 - name: DEFAULT_SCOPE_PERMISSIONS
   description: Comma-separated list of permissions that bind to default workspace scope (more specific patterns override broader TENANT_SCOPE_PERMISSIONS entries)
   value: ''
+- name: AUTOMATIC_SCOPE_MIGRATION_ENABLED
+  description: |
+    Enable automatic migration of system roles whose scope has changed during seeding. (On a deployment where system
+    roles already exist, this should only be enabled after manually ensuring each role is migrated through the internal
+    API. It is safe to enable this on a new deployment.)
+  value: 'False'
 - name: WORKSPACE_ACCESS_TIMING_ENABLED
   description: Enable detailed timing logs for v2 workspace access checks (for performance investigation)
   value: 'False'
+- name: PARITY_CHECK_ENABLED
+  description: Enable parity access checks between RBAC and Inventory API
+  value: ''
+- name: PARITY_CHECK_INTERVAL_SECONDS
+  description: Time in seconds in which job runs
+  value: '300'
+- name: PARITY_CHECK_TENANT_SAMPLE_SIZE
+  description: Max tenants per run
+  value: '10'
+- name: PARITY_CHECK_PRINCIPAL_SAMPLE_SIZE
+  description: Max principals per tenant
+  value: '50'
+- name: MIN_POSTGRES_EXPORTER_REPLICAS
+  description: Minimum replicas for postgres-exporter
+  value: '0'
+- name: POSTGRES_EXPORTER_IMAGE
+  description: Postgres exporter image
+  value: quay.io/prometheuscommunity/postgres-exporter:v0.19.1
+- name: POSTGRES_EXPORTER_CPU_REQUEST
+  description: Postgres exporter CPU request
+  value: 1m
+- name: POSTGRES_EXPORTER_MEMORY_REQUEST
+  description: Postgres exporter memory request
+  value: 16Mi
+- name: POSTGRES_EXPORTER_CPU_LIMIT
+  description: Postgres exporter CPU limit
+  value: 100m
+- name: POSTGRES_EXPORTER_MEMORY_LIMIT
+  description: Postgres exporter memory limit
+  value: 64Mi

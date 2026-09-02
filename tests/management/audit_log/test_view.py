@@ -260,6 +260,72 @@ class AuditLogViewTests(IdentityRequest):
         self.assertEqual(response.data.get("meta").get("count"), 4)
         self.assertEqual(len(response.data.get("data")), 2)
 
+    def _format_dt(self, dt):
+        """Format datetime as ISO 8601 with Z suffix for use in query parameters."""
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def test_filter_by_created_after(self):
+        """Test filtering audit logs created after a given timestamp."""
+        url = reverse("v1_management:auditlog-list")
+        # audit_log3 is 1 day ago, audit_log4 is now — both should match
+        cutoff = self._format_dt(timezone.now() - timedelta(days=1, seconds=1))
+        url = f"{url}?created_after={cutoff}"
+        client = APIClient()
+        response = client.get(url, **self.headers)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("meta").get("count"), 2)
+
+    def test_filter_by_created_before(self):
+        """Test filtering audit logs created before a given timestamp."""
+        url = reverse("v1_management:auditlog-list")
+        # audit_log1 is 3 days ago, audit_log2 is 2 days ago — both should match
+        cutoff = self._format_dt(timezone.now() - timedelta(days=1, seconds=1))
+        url = f"{url}?created_before={cutoff}"
+        client = APIClient()
+        response = client.get(url, **self.headers)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("meta").get("count"), 2)
+
+    def test_filter_by_date_range(self):
+        """Test filtering audit logs within a date range (created_after + created_before)."""
+        url = reverse("v1_management:auditlog-list")
+        # Only audit_log2 (2 days ago) and audit_log3 (1 day ago) should match
+        after = self._format_dt(timezone.now() - timedelta(days=2, seconds=1))
+        before = self._format_dt(timezone.now() - timedelta(seconds=1))
+        url = f"{url}?created_after={after}&created_before={before}"
+        client = APIClient()
+        response = client.get(url, **self.headers)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("meta").get("count"), 2)
+        usernames = {log["principal_username"] for log in response.data.get("data")}
+        self.assertEqual(usernames, {"user2", "user1"})
+
+    def test_filter_created_after_with_other_filters(self):
+        """Test combining created_after with resource_type filter."""
+        url = reverse("v1_management:auditlog-list")
+        cutoff = self._format_dt(timezone.now() - timedelta(days=1, seconds=1))
+        url = f"{url}?created_after={cutoff}&resource_type=role"
+        client = APIClient()
+        response = client.get(url, **self.headers)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("meta").get("count"), 1)
+        self.assertEqual(response.data.get("data")[0]["action"], "edit")
+
+    def test_filter_created_after_no_results(self):
+        """Test created_after filter that excludes all entries."""
+        url = reverse("v1_management:auditlog-list")
+        future = self._format_dt(timezone.now() + timedelta(days=1))
+        url = f"{url}?created_after={future}"
+        client = APIClient()
+        response = client.get(url, **self.headers)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("meta").get("count"), 0)
+
     def test_filter_and_ordering_combined(self):
         """Test combining filtering and ordering."""
         url = reverse("v1_management:auditlog-list")
@@ -272,3 +338,53 @@ class AuditLogViewTests(IdentityRequest):
         # Should have role logs ordered by created desc
         self.assertEqual(response.data.get("data")[0]["action"], "edit")
         self.assertEqual(response.data.get("data")[1]["action"], "create")
+
+    def test_sequence_field_present(self):
+        """Test that each audit log entry includes a sequence number."""
+        url = reverse("v1_management:auditlog-list")
+        client = APIClient()
+        response = client.get(url, **self.headers)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        for entry in response.data.get("data"):
+            self.assertIn("sequence", entry)
+            self.assertIsInstance(entry["sequence"], int)
+            self.assertGreater(entry["sequence"], 0)
+
+    def test_sequence_monotonically_increasing(self):
+        """Test that sequence numbers are monotonically increasing for entries created in order."""
+        url = reverse("v1_management:auditlog-list")
+        url = f"{url}?order_by=sequence"
+        client = APIClient()
+        response = client.get(url, **self.headers)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        sequences = [entry["sequence"] for entry in response.data.get("data")]
+        # Sequences should be strictly increasing when ordered ascending
+        for i in range(1, len(sequences)):
+            self.assertGreater(sequences[i], sequences[i - 1])
+
+    def test_ordering_by_sequence_desc(self):
+        """Test ordering audit logs by sequence descending."""
+        url = reverse("v1_management:auditlog-list")
+        url = f"{url}?order_by=-sequence"
+        client = APIClient()
+        response = client.get(url, **self.headers)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        sequences = [entry["sequence"] for entry in response.data.get("data")]
+        self.assertEqual(sequences, sorted(sequences, reverse=True))
+        # Newest entry (admin/add) should be first (highest sequence)
+        self.assertEqual(response.data.get("data")[0]["principal_username"], "admin")
+
+    def test_default_ordering_is_deterministic(self):
+        """Test that default ordering uses sequence (id) for deterministic results."""
+        url = reverse("v1_management:auditlog-list")
+        client = APIClient()
+        response = client.get(url, **self.headers)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.data.get("data")
+        # Default ordering is -id (newest first), same as -sequence
+        sequences = [entry["sequence"] for entry in data]
+        self.assertEqual(sequences, sorted(sequences, reverse=True))

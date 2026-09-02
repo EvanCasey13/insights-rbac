@@ -549,7 +549,9 @@ class WorkspaceTestsCreateUpdateDelete(TransactionalWorkspaceViewTests):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         resp_body = json.loads(response.content.decode())
         self.assertEqual(
-            resp_body.get("detail"), "The total number of workspaces allowed for this organization has been exceeded."
+            resp_body.get("detail"),
+            "Workspace limit reached (6/4); please free up capacity by deleting empty workspaces"
+            " or consolidating those with similar users and role bindings.",
         )
 
     @override_settings(WORKSPACE_ORG_CREATION_LIMIT=9)
@@ -1314,6 +1316,110 @@ class WorkspaceTestsCreateUpdateDelete(TransactionalWorkspaceViewTests):
         response_message = response.json()
         self.assertEqual(response_message.get("name"), wsB.name)
         self.assertEqual(response_message.get("parent_id"), str(wsA.id))
+
+    def test_create_workspace_invalid_name_characters(self):
+        """Test that create rejects names with disallowed characters."""
+        client = APIClient()
+        url = reverse("v2_management:workspace-list")
+        for invalid_name in ["ws@name", "ws#name", "ws!name", "ws.name", "ws/name", "ws+name"]:
+            response = client.post(
+                url,
+                {"name": invalid_name, "parent_id": self.default_workspace.id},
+                format="json",
+                **self.headers,
+            )
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, f"Expected 400 for '{invalid_name}'")
+
+    def test_create_workspace_valid_name_characters(self):
+        """Test that create accepts names with allowed characters."""
+        client = APIClient()
+        url = reverse("v2_management:workspace-list")
+        valid_names = ["My Workspace", "ws-name", "ws_name", "Workspace 123", "simple"]
+        for valid_name in valid_names:
+            response = client.post(
+                url,
+                {"name": valid_name, "parent_id": self.default_workspace.id},
+                format="json",
+                **self.headers,
+            )
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED, f"Expected 201 for '{valid_name}'")
+
+    def test_update_workspace_invalid_name_characters(self):
+        """Test that PUT rejects a new name with disallowed characters."""
+        workspace = Workspace.objects.create(
+            name="Valid Name",
+            tenant=self.tenant,
+            parent=self.default_workspace,
+            type=Workspace.Types.STANDARD,
+        )
+        client = APIClient()
+        url = reverse("v2_management:workspace-detail", kwargs={"pk": workspace.id})
+        response = client.put(
+            url,
+            {"name": "invalid@name", "parent_id": workspace.parent_id},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_partial_update_workspace_invalid_name_characters(self):
+        """Test that PATCH rejects a new name with disallowed characters."""
+        workspace = Workspace.objects.create(
+            name="Valid Name",
+            tenant=self.tenant,
+            parent=self.default_workspace,
+            type=Workspace.Types.STANDARD,
+        )
+        client = APIClient()
+        url = reverse("v2_management:workspace-detail", kwargs={"pk": workspace.id})
+        response = client.patch(url, {"name": "bad!name"}, format="json", **self.headers)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_update_workspace_legacy_name_unchanged(self):
+        """Test that PUT with an unchanged legacy name (with disallowed chars) succeeds."""
+        workspace = Workspace.objects.create(
+            name="legacy@name",
+            tenant=self.tenant,
+            parent=self.default_workspace,
+            type=Workspace.Types.STANDARD,
+        )
+        client = APIClient()
+        url = reverse("v2_management:workspace-detail", kwargs={"pk": workspace.id})
+        response = client.put(
+            url,
+            {"name": "legacy@name", "description": "updated desc", "parent_id": workspace.parent_id},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["name"], "legacy@name")
+
+    def test_partial_update_workspace_legacy_name_not_sent(self):
+        """Test that PATCH without name field on a workspace with legacy name succeeds."""
+        workspace = Workspace.objects.create(
+            name="legacy@name",
+            tenant=self.tenant,
+            parent=self.default_workspace,
+            type=Workspace.Types.STANDARD,
+        )
+        client = APIClient()
+        url = reverse("v2_management:workspace-detail", kwargs={"pk": workspace.id})
+        response = client.patch(url, {"description": "updated desc"}, format="json", **self.headers)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["name"], "legacy@name")
+
+    def test_update_workspace_legacy_name_changed_to_invalid(self):
+        """Test that changing a legacy name to a different invalid name is rejected."""
+        workspace = Workspace.objects.create(
+            name="legacy@name",
+            tenant=self.tenant,
+            parent=self.default_workspace,
+            type=Workspace.Types.STANDARD,
+        )
+        client = APIClient()
+        url = reverse("v2_management:workspace-detail", kwargs={"pk": workspace.id})
+        response = client.patch(url, {"name": "other@invalid"}, format="json", **self.headers)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_update_workspace_invalid_uuid(self):
         """Test that update fails with 400 when workspace id is not a valid UUID."""
@@ -2871,8 +2977,8 @@ class WorkspaceTestsList(WorkspaceViewTests):
         self.assertEqual(payload.get("data")[0]["id"], str(self.root_workspace.id))
         self.assertType(payload, "root")
 
-    def test_workspace_list_filter_by_name(self):
-        """List workspaces filtered by name using case-insensitive substring matching."""
+    def test_workspace_list_filter_by_name_substring(self):
+        """Test that name filter without wildcards does case-insensitive substring match."""
         ws_name_1 = "Sales Team Alpha"
         ws_name_2 = "Sales Team Beta"
         ws_name_3 = "Engineering Squad"
@@ -2902,34 +3008,111 @@ class WorkspaceTestsList(WorkspaceViewTests):
         url = reverse("v2_management:workspace-list")
         client = APIClient()
 
-        # Substring "Sales" matches Sales Team Alpha and Sales Team Beta
-        response = client.get(f"{url}?name=Sales", None, format="json", **self.headers)
-        payload = response.data
-        self.assertSuccessfulList(response, payload)
-        self.assertEqual(payload.get("meta").get("count"), 2)
-
-        # Substring "Alpha" matches only Sales Team Alpha
-        response = client.get(f"{url}?name=Alpha", None, format="json", **self.headers)
+        # Full name "Sales Team Alpha" returns only that workspace
+        response = client.get(f"{url}?name=Sales Team Alpha", None, format="json", **self.headers)
         payload = response.data
         self.assertSuccessfulList(response, payload)
         self.assertEqual(payload.get("meta").get("count"), 1)
         self.assertEqual(payload.get("data")[0]["name"], ws_name_1)
 
-        # Substring "Squad" matches only Engineering Squad
-        response = client.get(f"{url}?name=Squad", None, format="json", **self.headers)
+        # Partial string "Sales" matches both Sales workspaces (substring semantics)
+        response = client.get(f"{url}?name=Sales", None, format="json", **self.headers)
+        payload = response.data
+        self.assertSuccessfulList(response, payload)
+        self.assertEqual(payload.get("meta").get("count"), 2)
+
+        # Full name match for "Engineering Squad"
+        response = client.get(f"{url}?name=Engineering Squad", None, format="json", **self.headers)
         payload = response.data
         self.assertSuccessfulList(response, payload)
         self.assertEqual(payload.get("meta").get("count"), 1)
         self.assertEqual(payload.get("data")[0]["name"], ws_name_3)
 
-        # Middle substring "Team" matches both Sales Team workspaces
-        response = client.get(f"{url}?name=Team", None, format="json", **self.headers)
+    def test_workspace_list_filter_by_name_wildcard(self):
+        """Test that name filter with * wildcards does glob pattern matching."""
+        ws_name_1 = "Sales Team Alpha"
+        ws_name_2 = "Sales Team Beta"
+        ws_name_3 = "Engineering Squad"
+        Workspace.objects.bulk_create(
+            [
+                Workspace(
+                    name=ws_name_1,
+                    tenant=self.tenant,
+                    type="standard",
+                    parent_id=self.default_workspace.id,
+                ),
+                Workspace(
+                    name=ws_name_2,
+                    tenant=self.tenant,
+                    type="standard",
+                    parent_id=self.default_workspace.id,
+                ),
+                Workspace(
+                    name=ws_name_3,
+                    tenant=self.tenant,
+                    type="standard",
+                    parent_id=self.default_workspace.id,
+                ),
+            ]
+        )
+
+        url = reverse("v2_management:workspace-list")
+        client = APIClient()
+
+        # Substring wildcard *Sales* matches both Sales Team workspaces
+        response = client.get(f"{url}?name=*Sales*", None, format="json", **self.headers)
         payload = response.data
         self.assertSuccessfulList(response, payload)
         self.assertEqual(payload.get("meta").get("count"), 2)
 
+        # Prefix wildcard Sales* matches both Sales Team workspaces
+        response = client.get(f"{url}?name=Sales*", None, format="json", **self.headers)
+        payload = response.data
+        self.assertSuccessfulList(response, payload)
+        self.assertEqual(payload.get("meta").get("count"), 2)
+
+        # Suffix wildcard *Alpha matches only Sales Team Alpha
+        response = client.get(f"{url}?name=*Alpha", None, format="json", **self.headers)
+        payload = response.data
+        self.assertSuccessfulList(response, payload)
+        self.assertEqual(payload.get("meta").get("count"), 1)
+        self.assertEqual(payload.get("data")[0]["name"], ws_name_1)
+
+        # Substring wildcard *Team* matches both Sales Team workspaces
+        response = client.get(f"{url}?name=*Team*", None, format="json", **self.headers)
+        payload = response.data
+        self.assertSuccessfulList(response, payload)
+        self.assertEqual(payload.get("meta").get("count"), 2)
+
+        # Complex pattern Sales*Alpha matches only Sales Team Alpha
+        response = client.get(f"{url}?name=Sales*Alpha", None, format="json", **self.headers)
+        payload = response.data
+        self.assertSuccessfulList(response, payload)
+        self.assertEqual(payload.get("meta").get("count"), 1)
+        self.assertEqual(payload.get("data")[0]["name"], ws_name_1)
+
+    def test_workspace_list_filter_by_name_wildcard_no_match(self):
+        """Test that a wildcard pattern matching nothing returns empty list."""
+        url = reverse("v2_management:workspace-list")
+        client = APIClient()
+        response = client.get(f"{url}?name=zzz*", None, format="json", **self.headers)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["data"], [])
+
+    def test_workspace_list_filter_by_name_wildcard_star_returns_all(self):
+        """Test that name=* returns all workspaces (no filter applied)."""
+        url = reverse("v2_management:workspace-list")
+        client = APIClient()
+        total_count = Workspace.objects.count()
+
+        response = client.get(f"{url}?name=*", None, format="json", **self.headers)
+        payload = response.data
+        self.assertSuccessfulList(response, payload)
+        self.assertEqual(payload.get("meta").get("count"), total_count)
+
     def test_workspace_list_filter_by_name_is_case_insensitive(self):
-        """Test that name filter is case-insensitive substring matching."""
+        """Test that name filter is case-insensitive for both substring and wildcard matching."""
         Workspace.objects.create(
             name="Sales Team Alpha",
             tenant=self.tenant,
@@ -2940,15 +3123,22 @@ class WorkspaceTestsList(WorkspaceViewTests):
         url = reverse("v2_management:workspace-list")
         client = APIClient()
 
-        # Lowercase substring should match "Sales Team Alpha"
-        response = client.get(f"{url}?name=sales", None, format="json", **self.headers)
+        # Lowercase substring match
+        response = client.get(f"{url}?name=sales team alpha", None, format="json", **self.headers)
         payload = response.data
         self.assertSuccessfulList(response, payload)
         self.assertEqual(payload.get("meta").get("count"), 1)
         self.assertEqual(payload.get("data")[0]["name"], "Sales Team Alpha")
 
-        # Uppercase substring should also match
-        response = client.get(f"{url}?name=SALES", None, format="json", **self.headers)
+        # Uppercase substring match
+        response = client.get(f"{url}?name=SALES TEAM ALPHA", None, format="json", **self.headers)
+        payload = response.data
+        self.assertSuccessfulList(response, payload)
+        self.assertEqual(payload.get("meta").get("count"), 1)
+        self.assertEqual(payload.get("data")[0]["name"], "Sales Team Alpha")
+
+        # Case-insensitive wildcard
+        response = client.get(f"{url}?name=*sales*", None, format="json", **self.headers)
         payload = response.data
         self.assertSuccessfulList(response, payload)
         self.assertEqual(payload.get("meta").get("count"), 1)
@@ -3114,7 +3304,6 @@ class WorkspaceTestsList(WorkspaceViewTests):
         """Test filtering workspaces by multiple comma-separated ids."""
         url = reverse("v2_management:workspace-list")
         client = APIClient()
-        # Use two standard workspaces since ids filter defaults to type=standard
         ids = f"{self.standard_workspace.id},{self.standard_sub_workspace.id}"
         response = client.get(f"{url}?ids={ids}", None, format="json", **self.headers)
         payload = response.data
@@ -3183,20 +3372,20 @@ class WorkspaceTestsList(WorkspaceViewTests):
         self.assertIn(str(self.default_workspace.id), returned_ids)
         self.assertIn(str(self.root_workspace.id), returned_ids)
 
-    def test_workspace_list_filter_by_ids_defaults_to_standard(self):
-        """Test that ids filter defaults to type=standard when type not specified."""
+    def test_workspace_list_filter_by_ids_returns_all_types(self):
+        """Test that ids filter without type returns all matching workspaces regardless of type."""
         url = reverse("v2_management:workspace-list")
         client = APIClient()
-        # Include workspaces of different types
         ids = f"{self.standard_workspace.id},{self.default_workspace.id},{self.root_workspace.id}"
         response = client.get(f"{url}?ids={ids}", None, format="json", **self.headers)
         payload = response.data
 
         self.assertSuccessfulList(response, payload)
-        # Only the standard workspace should be returned (default type filter)
-        self.assertEqual(payload.get("meta").get("count"), 1)
-        self.assertEqual(payload.get("data")[0]["id"], str(self.standard_workspace.id))
-        self.assertEqual(payload.get("data")[0]["type"], "standard")
+        self.assertEqual(payload.get("meta").get("count"), 3)
+        returned_ids = [ws["id"] for ws in payload.get("data")]
+        self.assertIn(str(self.standard_workspace.id), returned_ids)
+        self.assertIn(str(self.default_workspace.id), returned_ids)
+        self.assertIn(str(self.root_workspace.id), returned_ids)
 
     def test_workspace_list_filter_by_parent_id(self):
         """Test filtering workspaces by parent_id returns only direct children."""
@@ -3359,6 +3548,477 @@ class WorkspaceTestsList(WorkspaceViewTests):
         # Verify no current-tenant workspaces leaked into the response
         returned_ids = {ws["id"] for ws in payload.get("data")}
         self.assertNotIn(str(self.default_workspace.id), returned_ids)
+
+
+@override_settings(ATOMIC_RETRY_DISABLED=True, V2_APIS_ENABLED=True)
+class WorkspaceTestsQuery(WorkspaceViewTests):
+    """Tests for POST /v2/workspaces/query/ endpoint."""
+
+    def _query_url(self):
+        return reverse("v2_management:workspace-query")
+
+    def assertSuccessfulList(self, response, payload):
+        """Common list success assertions."""
+        self.assertIsInstance(payload.get("data"), list)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.get("content-type"), "application/json")
+        for keyname in ["meta", "links", "data"]:
+            self.assertIn(keyname, payload)
+        data = payload.get("data")
+        if data:
+            for keyname in ["name", "id", "parent_id", "description", "type"]:
+                self.assertIn(keyname, data[0])
+
+    def test_query_by_single_id(self):
+        """Query workspaces with a single ID in the body."""
+        client = APIClient()
+        response = client.post(
+            self._query_url(),
+            data={"ids": [str(self.standard_workspace.id)]},
+            format="json",
+            **self.headers,
+        )
+        payload = response.data
+
+        self.assertSuccessfulList(response, payload)
+        self.assertEqual(payload["meta"]["count"], 1)
+        self.assertEqual(payload["data"][0]["id"], str(self.standard_workspace.id))
+
+    def test_query_by_multiple_ids(self):
+        """Query workspaces with multiple IDs in the body."""
+        client = APIClient()
+        response = client.post(
+            self._query_url(),
+            data={"ids": [str(self.standard_workspace.id), str(self.standard_sub_workspace.id)]},
+            format="json",
+            **self.headers,
+        )
+        payload = response.data
+
+        self.assertSuccessfulList(response, payload)
+        self.assertEqual(payload["meta"]["count"], 2)
+        returned_ids = [ws["id"] for ws in payload["data"]]
+        self.assertIn(str(self.standard_workspace.id), returned_ids)
+        self.assertIn(str(self.standard_sub_workspace.id), returned_ids)
+
+    def test_query_ids_returns_all_types(self):
+        """Query by IDs without type returns all matching workspaces regardless of type."""
+        client = APIClient()
+        response = client.post(
+            self._query_url(),
+            data={
+                "ids": [
+                    str(self.standard_workspace.id),
+                    str(self.default_workspace.id),
+                    str(self.root_workspace.id),
+                ]
+            },
+            format="json",
+            **self.headers,
+        )
+        payload = response.data
+
+        self.assertSuccessfulList(response, payload)
+        self.assertEqual(payload["meta"]["count"], 3)
+        returned_ids = [ws["id"] for ws in payload["data"]]
+        self.assertIn(str(self.standard_workspace.id), returned_ids)
+        self.assertIn(str(self.default_workspace.id), returned_ids)
+        self.assertIn(str(self.root_workspace.id), returned_ids)
+
+    def test_query_ids_with_type_all(self):
+        """Query with type=all returns workspaces of all types."""
+        client = APIClient()
+        response = client.post(
+            self._query_url(),
+            data={
+                "ids": [
+                    str(self.standard_workspace.id),
+                    str(self.default_workspace.id),
+                    str(self.root_workspace.id),
+                ],
+                "type": "all",
+            },
+            format="json",
+            **self.headers,
+        )
+        payload = response.data
+
+        self.assertSuccessfulList(response, payload)
+        self.assertEqual(payload["meta"]["count"], 3)
+
+    def test_query_ids_with_specific_type(self):
+        """Query with specific type filter narrows results."""
+        client = APIClient()
+        response = client.post(
+            self._query_url(),
+            data={
+                "ids": [
+                    str(self.standard_workspace.id),
+                    str(self.ungrouped_workspace.id),
+                    str(self.root_workspace.id),
+                ],
+                "type": "standard,ungrouped-hosts",
+            },
+            format="json",
+            **self.headers,
+        )
+        payload = response.data
+
+        self.assertSuccessfulList(response, payload)
+        self.assertEqual(payload["meta"]["count"], 2)
+        returned_ids = [ws["id"] for ws in payload["data"]]
+        self.assertIn(str(self.standard_workspace.id), returned_ids)
+        self.assertIn(str(self.ungrouped_workspace.id), returned_ids)
+        self.assertNotIn(str(self.root_workspace.id), returned_ids)
+
+    def test_query_with_parent_id_filter(self):
+        """Query with parent_id narrows to direct children of that parent."""
+        client = APIClient()
+        response = client.post(
+            self._query_url(),
+            data={
+                "ids": [str(self.standard_workspace.id), str(self.standard_sub_workspace.id)],
+                "parent_id": str(self.default_workspace.id),
+            },
+            format="json",
+            **self.headers,
+        )
+        payload = response.data
+
+        self.assertSuccessfulList(response, payload)
+        # standard_sub_workspace is child of standard_workspace, not default_workspace
+        self.assertEqual(payload["meta"]["count"], 1)
+        self.assertEqual(payload["data"][0]["id"], str(self.standard_workspace.id))
+
+    def test_query_with_name_filter(self):
+        """Query with name filter narrows results."""
+        client = APIClient()
+        response = client.post(
+            self._query_url(),
+            data={
+                "ids": [str(self.standard_workspace.id), str(self.standard_sub_workspace.id)],
+                "name": "Sub-workspace",
+            },
+            format="json",
+            **self.headers,
+        )
+        payload = response.data
+
+        self.assertSuccessfulList(response, payload)
+        self.assertEqual(payload["meta"]["count"], 1)
+        self.assertEqual(payload["data"][0]["id"], str(self.standard_sub_workspace.id))
+
+    def test_query_nonexistent_ids(self):
+        """Query with valid UUIDs that don't exist returns empty results."""
+        client = APIClient()
+        non_existent_uuid = "00000000-0000-0000-0000-000000000000"
+        response = client.post(
+            self._query_url(),
+            data={"ids": [non_existent_uuid]},
+            format="json",
+            **self.headers,
+        )
+        payload = response.data
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(payload["meta"]["count"], 0)
+
+    def test_query_missing_ids_returns_400(self):
+        """Query without ids field returns 400."""
+        client = APIClient()
+        response = client.post(
+            self._query_url(),
+            data={},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_query_empty_ids_returns_400(self):
+        """Query with empty ids list returns 400."""
+        client = APIClient()
+        response = client.post(
+            self._query_url(),
+            data={"ids": []},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_query_invalid_uuid_returns_400(self):
+        """Query with invalid UUID in ids returns 400."""
+        client = APIClient()
+        response = client.post(
+            self._query_url(),
+            data={"ids": ["not-a-uuid"]},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_query_invalid_type_returns_400(self):
+        """Query with invalid type returns 400."""
+        client = APIClient()
+        response = client.post(
+            self._query_url(),
+            data={"ids": [str(self.standard_workspace.id)], "type": "invalid"},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_query_deduplicates_ids(self):
+        """Query with duplicate IDs deduplicates them."""
+        client = APIClient()
+        ws_id = str(self.standard_workspace.id)
+        response = client.post(
+            self._query_url(),
+            data={"ids": [ws_id, ws_id, ws_id]},
+            format="json",
+            **self.headers,
+        )
+        payload = response.data
+
+        self.assertSuccessfulList(response, payload)
+        self.assertEqual(payload["meta"]["count"], 1)
+
+    def test_query_get_method_not_allowed(self):
+        """GET on the query endpoint returns 405."""
+        client = APIClient()
+        response = client.get(self._query_url(), format="json", **self.headers)
+        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def test_query_respects_pagination(self):
+        """Query endpoint respects limit/offset pagination from query params."""
+        client = APIClient()
+        response = client.post(
+            f"{self._query_url()}?limit=1&offset=0",
+            data={"ids": [str(self.standard_workspace.id), str(self.standard_sub_workspace.id)]},
+            format="json",
+            **self.headers,
+        )
+        payload = response.data
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(payload["meta"]["count"], 2)
+        self.assertEqual(len(payload["data"]), 1)
+
+    def test_query_unauthorized_non_admin(self):
+        """Non-admin user without workspace permissions gets 403 on query endpoint."""
+        request_context = self._create_request_context(self.customer_data, self.user_data, is_org_admin=False)
+        headers = request_context["request"].META
+
+        client = APIClient()
+        response = client.post(
+            self._query_url(),
+            data={"ids": [str(self.standard_workspace.id)]},
+            format="json",
+            **headers,
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @patch("core.kafka.RBACProducer.send_kafka_message")
+    def test_query_authorized_with_read_permission(self, send_kafka_message):
+        """Non-admin user with read permission can query workspaces."""
+        request_context = self._create_request_context(self.customer_data, self.user_data, is_org_admin=False)
+        headers = request_context["request"].META
+
+        self._setup_access_for_principal(self.user_data["username"], "inventory:groups:read")
+
+        client = APIClient()
+        response = client.post(
+            self._query_url(),
+            data={"ids": [str(self.standard_workspace.id)], "type": "all"},
+            format="json",
+            **headers,
+        )
+        payload = response.data
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsInstance(payload.get("data"), list)
+        self.assertEqual(payload["meta"]["count"], 1)
+
+    @patch("core.kafka.RBACProducer.send_kafka_message")
+    def test_query_uses_read_not_write_permission(self, send_kafka_message):
+        """Query endpoint uses read permission despite being POST.
+
+        A user with only read permission (not write) should be able to query,
+        confirming the endpoint correctly maps POST to 'read' operation.
+        """
+        request_context = self._create_request_context(self.customer_data, self.user_data, is_org_admin=False)
+        headers = request_context["request"].META
+
+        # Only grant read permission, no write
+        self._setup_access_for_principal(self.user_data["username"], "inventory:groups:read")
+
+        client = APIClient()
+        response = client.post(
+            self._query_url(),
+            data={"ids": [str(self.standard_workspace.id)], "type": "all"},
+            format="json",
+            **headers,
+        )
+        # Should succeed with read-only permission
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    @patch("core.kafka.RBACProducer.send_kafka_message")
+    def test_query_scoped_access_filters_results(self, send_kafka_message):
+        """Non-admin user with scoped read permission only sees accessible workspaces."""
+        another_ws = Workspace.objects.create(
+            name="Another Standard Workspace",
+            tenant=self.tenant,
+            type="standard",
+            parent_id=self.default_workspace.id,
+        )
+
+        request_context = self._create_request_context(self.customer_data, self.user_data, is_org_admin=False)
+        headers = request_context["request"].META
+
+        # Grant read access scoped only to standard_workspace
+        self._setup_access_for_principal(
+            self.user_data["username"], "inventory:groups:read", workspace_id=str(self.standard_workspace.id)
+        )
+
+        client = APIClient()
+        response = client.post(
+            self._query_url(),
+            data={"ids": [str(self.standard_workspace.id), str(another_ws.id)], "type": "all"},
+            format="json",
+            **headers,
+        )
+        payload = response.data
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        returned_ids = [ws["id"] for ws in payload.get("data", [])]
+        # User can see the workspace they have access to and its descendants
+        self.assertIn(str(self.standard_workspace.id), returned_ids)
+        # User cannot see the workspace they do NOT have access to
+        self.assertNotIn(str(another_ws.id), returned_ids)
+
+    def test_query_nul_byte_in_type_returns_400(self):
+        """Query with NUL byte in type field returns 400."""
+        client = APIClient()
+        response = client.post(
+            self._query_url(),
+            data={"ids": [str(self.standard_workspace.id)], "type": "standard\x00evil"},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_query_nul_byte_in_name_returns_400(self):
+        """Query with NUL byte in name field returns 400."""
+        client = APIClient()
+        response = client.post(
+            self._query_url(),
+            data={"ids": [str(self.standard_workspace.id)], "name": "test\x00evil"},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_query_case_insensitive_uuid_matching(self):
+        """Query with uppercase UUIDs matches correctly."""
+        client = APIClient()
+        upper_uuid = str(self.standard_workspace.id).upper()
+        response = client.post(
+            self._query_url(),
+            data={"ids": [upper_uuid]},
+            format="json",
+            **self.headers,
+        )
+        payload = response.data
+
+        self.assertSuccessfulList(response, payload)
+        self.assertEqual(payload["meta"]["count"], 1)
+        self.assertEqual(payload["data"][0]["id"], str(self.standard_workspace.id))
+
+    def test_query_exceeding_max_ids_returns_400(self):
+        """Query with more than 3000 IDs returns 400."""
+        client = APIClient()
+        ids = [str(uuid4()) for _ in range(3001)]
+        response = client.post(
+            self._query_url(),
+            data={"ids": ids},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_query_pagination_links(self):
+        """Query endpoint returns correct pagination links."""
+        client = APIClient()
+        response = client.post(
+            f"{self._query_url()}?limit=1&offset=0",
+            data={"ids": [str(self.standard_workspace.id), str(self.standard_sub_workspace.id)]},
+            format="json",
+            **self.headers,
+        )
+        payload = response.data
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("links", payload)
+        links = payload["links"]
+        self.assertIn("first", links)
+        self.assertIn("next", links)
+        self.assertIn("last", links)
+
+    def test_query_with_ancestry(self):
+        """Query with with_ancestry=true includes ancestor/fallback workspaces."""
+        client = APIClient()
+        response = client.post(
+            self._query_url(),
+            data={
+                "ids": [str(self.standard_workspace.id)],
+                "with_ancestry": True,
+            },
+            format="json",
+            **self.headers,
+        )
+        payload = response.data
+
+        self.assertSuccessfulList(response, payload)
+        # with_ancestry expands access filter to include ancestors and fallback
+        # workspaces; for admin users with full access the parameter is accepted
+        # and the response still contains the requested workspace
+        returned_ids = [ws["id"] for ws in payload["data"]]
+        self.assertIn(str(self.standard_workspace.id), returned_ids)
+
+    def test_query_order_by_name_descending(self):
+        """Query endpoint respects order_by query parameter."""
+        client = APIClient()
+        response = client.post(
+            f"{self._query_url()}?order_by=-name",
+            data={"ids": [str(self.standard_workspace.id), str(self.standard_sub_workspace.id)]},
+            format="json",
+            **self.headers,
+        )
+        payload = response.data
+
+        self.assertSuccessfulList(response, payload)
+        self.assertEqual(payload["meta"]["count"], 2)
+        names = [ws["name"] for ws in payload["data"]]
+        self.assertEqual(names, sorted(names, reverse=True))
+
+    def test_query_empty_and_whitespace_optional_fields(self):
+        """Query with empty or whitespace-only name/type treats them as unset."""
+        client = APIClient()
+        # Empty string name and whitespace-only type should be normalized to None
+        response = client.post(
+            self._query_url(),
+            data={
+                "ids": [str(self.standard_workspace.id), str(self.standard_sub_workspace.id)],
+                "name": "",
+                "type": "   ",
+            },
+            format="json",
+            **self.headers,
+        )
+        payload = response.data
+
+        self.assertSuccessfulList(response, payload)
+        # Both workspaces returned because empty filters are ignored
+        self.assertEqual(payload["meta"]["count"], 2)
 
 
 @override_settings(ATOMIC_RETRY_DISABLED=True, V2_APIS_ENABLED=True)

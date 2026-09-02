@@ -1678,6 +1678,20 @@ class GroupViewsetTests(IdentityRequest):
             ]
             kafka_mock.assert_has_calls(notification_messages, any_order=True)
 
+            # Verify that custom default group creation is recorded in audit logs
+            al_url = "/api/rbac/v1/auditlogs/"
+            al_client = APIClient()
+            al_response = al_client.get(al_url, **self.headers)
+            al_list = al_response.data.get("data")
+            # Find the audit log entry for the custom default group creation
+            create_entries = [
+                entry for entry in al_list if entry["action"] == "create" and entry["resource_type"] == "group"
+            ]
+            self.assertTrue(len(create_entries) > 0, "Expected audit log for custom default group creation")
+            create_entry = create_entries[0]
+            self.assertIn("Custom default access", create_entry["description"])
+            self.assertEqual(create_entry["principal_username"], self.user_data["username"])
+
     @override_settings(V2_BOOTSTRAP_TENANT=True)
     @patch("management.relation_replicator.outbox_replicator.OutboxReplicator._save_replication_event")
     @patch("core.kafka.RBACProducer.send_kafka_message")
@@ -1938,6 +1952,17 @@ class GroupViewsetTests(IdentityRequest):
                 ),
             ]
             kafka_mock.assert_has_calls(notification_messages, any_order=True)
+
+            # Verify that custom default group creation is recorded in audit logs
+            al_url = "/api/rbac/v1/auditlogs/"
+            al_client = APIClient()
+            al_response = al_client.get(al_url, **self.headers)
+            al_list = al_response.data.get("data")
+            create_entries = [
+                entry for entry in al_list if entry["action"] == "create" and entry["resource_type"] == "group"
+            ]
+            self.assertTrue(len(create_entries) > 0, "Expected audit log for custom default group creation")
+            self.assertIn("Custom default access", create_entries[0]["description"])
 
     def test_add_group_roles_bad_group_guid(self):
         """Test that adding a role to invalid group returns 400."""
@@ -5955,7 +5980,8 @@ class GroupViewNonAdminTests(IdentityRequest):
         ]
 
         class MockResponse:
-            def __init__(self, json_response):
+            def __init__(self, url, json_response):
+                self.url = url
                 self.status_code = 200
                 self._json = json_response
                 self.content = json.dumps(json_response)
@@ -5967,8 +5993,8 @@ class GroupViewNonAdminTests(IdentityRequest):
             if url.endswith("/service_accounts/v1") and (
                 not (client_ids := params.get("clientId")) or sa_uuid in client_ids
             ):
-                return MockResponse(mocked_values)
-            return MockResponse([])
+                return MockResponse(url, mocked_values)
+            return MockResponse(url, [])
 
         mock_request.side_effect = mock_get
         mock_request.__name__ = "request_service_accounts"
@@ -7221,7 +7247,6 @@ class GroupReplicationTests(IdentityRequest):
 
         # Now approve a CAR for the tenant and the same role
         request = CrossAccountRequest.objects.create(
-            target_account=self.tenant.account_id,
             target_org=self.tenant.org_id,
             user_id="2222222",
             end_date=timezone.now() + timedelta(10),
@@ -7332,7 +7357,6 @@ class GroupReplicationTests(IdentityRequest):
 
         # Now approve a CAR for the tenant and the same role
         request = CrossAccountRequest.objects.create(
-            target_account=self.tenant.account_id,
             target_org=self.tenant.org_id,
             user_id="2222222",
             end_date=timezone.now() + timedelta(10),

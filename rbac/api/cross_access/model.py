@@ -32,6 +32,8 @@ STATUS_LIST = ["pending", "cancelled", "approved", "denied", "expired"]
 class CrossAccountRequest(models.Model):
     """Cross account access request."""
 
+    STATUS_APPROVED = "approved"
+
     request_id = models.UUIDField(default=uuid4, editable=False, unique=True, null=False, primary_key=True)
     target_account = models.CharField(max_length=36, default=None, null=True)
     target_org = models.CharField(max_length=36, default=None)
@@ -40,7 +42,7 @@ class CrossAccountRequest(models.Model):
     start_date = models.DateTimeField(default=timezone.now)
     end_date = models.DateTimeField(null=False, blank=False, default=None)
     modified = AutoDateTimeField(default=timezone.now)
-    status = models.CharField(max_length=10, default="pending")
+    status = models.CharField(max_length=10, default="pending", db_index=True)
     roles = models.ManyToManyField("management.Role", through="RequestsRoles")
 
     def validate_date(self, date):

@@ -142,11 +142,24 @@ class RelationApiDualWriteGroupHandler(RelationApiDualWriteSubjectHandler):
         if self._expected_empty_relation_reason:
             logger.info(f"[Dual Write] Skipping empty replication event. {self._expected_empty_relation_reason}")
             return
-        try:
-            # Deduplicate relations_to_add to avoid duplicates when generate_relations
-            # is called multiple times with the same data
-            deduplicated_add = self._deduplicate_subject_relations(self.relations_to_add, handler_name="Group")
 
+        # Deduplicate relations_to_add to avoid duplicates when generate_relations
+        # is called multiple times with the same data
+        deduplicated_add = self._deduplicate_subject_relations(self.relations_to_add, handler_name="Group")
+
+        # Guard: skip empty events so they don't reach the outbox as spurious warnings.
+        # This can happen when all roles in a group operation have no binding mappings.
+        if not deduplicated_add and not self.relations_to_remove:
+            logger.info(
+                "[Dual Write] Skipping empty replication event for group(%s): '%s'. "
+                "Both add and remove relations are empty. event_type='%s'",
+                self.group.uuid,
+                self.group.name,
+                self.event_type,
+            )
+            return
+
+        try:
             self._replicator.replicate(
                 ReplicationEvent(
                     event_type=self.event_type,
@@ -182,28 +195,29 @@ class RelationApiDualWriteGroupHandler(RelationApiDualWriteSubjectHandler):
             if to_add:
                 self.relations_to_add.append(to_add)
 
-        # Go through current roles
-        # For each binding
-        # Remove all of this subject
-        # Replicate this removal
-        # Add back subject
-        # Replicate this addition
-        for role in roles:
-            # Note that we do not attempt to handle the case where the scope has changed. At time of writing
-            # (2025-10-08), this case is expected to be handled during seeding for system roles. It is unclear how
-            # custom roles should be handled.
-            scope = self._resource_service.scope_for_role(role)
+        # Go through current roles, and, for each binding:
+        # * Remove all of this subject
+        # * Replicate this removal
+        # * Add back subject
+        # * Replicate this addition
+        for role in self._with_system_roles_for_share(roles):
+            # When a role has mixed scopes including TENANT, create bindings at each scope
+            # so that workspace-scoped permissions are not lost.
+            binding_scopes = self._resource_service.binding_scopes_for_role(role)
 
-            self._update_mapping_for_role(
-                role,
-                scope=scope,
-                update_mapping=reset_mapping,
-                create_default_mapping_for_system_role=lambda resource: self._create_default_mapping_for_system_role(
-                    system_role=role,
-                    resource=resource,
-                    groups=frozenset([str(self.group.uuid)]),
-                ),
-            )
+            for scope in binding_scopes:
+                self._update_mapping_for_role(
+                    role,
+                    scope=scope,
+                    update_mapping=reset_mapping,
+                    create_default_mapping_for_system_role=(
+                        lambda resource, system_role=role: self._create_default_mapping_for_system_role(
+                            system_role=system_role,
+                            resource=resource,
+                            groups=frozenset([str(self.group.uuid)]),
+                        )
+                    ),
+                )
 
         if remove_default_access_from is not None:
             self.relations_to_remove.extend(
@@ -247,6 +261,9 @@ class RelationApiDualWriteGroupHandler(RelationApiDualWriteSubjectHandler):
         # so we always have to check at least the default workspace and the correct resource.
         #
         # In order to handle all these cases, we always attempt to remove the role from all scopes.
+        #
+        # As a consequence of this, we also do not have to lock any system roles here: we don't actually look at
+        # the role's permissions in determining where to remove it.
         for scope in Scope:
             self._update_mapping_for_role(
                 role,

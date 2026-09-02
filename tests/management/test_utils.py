@@ -23,6 +23,7 @@ from management.models import Access, Group, Permission, Principal, Policy, Role
 from management.principal.view import VALID_PRINCIPAL_TYPE_VALUE
 from management.utils import (
     access_for_principal,
+    get_principal_for_auth,
     get_principal_from_request,
     groups_for_principal,
     policies_for_principal,
@@ -34,6 +35,7 @@ from management.utils import (
     is_valid_uuid,
     value_to_list,
     build_system_user_from_token,
+    validate_psk,
 )
 from management.authorization.token_validator import ITSSOTokenValidator
 from tests.identity_request import IdentityRequest
@@ -414,6 +416,104 @@ class UtilsTests(IdentityRequest):
         self.assertEqual(created_principal.type, "user")
         self.assertEqual(created_principal.username, username)
 
+    @mock.patch(
+        "management.principal.proxy.PrincipalProxy.request_filtered_principals",
+        return_value={
+            "status_code": 200,
+            "data": [
+                {
+                    "org_id": "100001",
+                    "is_org_admin": False,
+                    "is_internal": False,
+                    "id": 52567473,
+                    "username": "other_user",
+                    "account_number": "1111111",
+                    "is_active": True,
+                }
+            ],
+        },
+    )
+    def test_get_principal_from_request_ignore_username_query_param(self, mock_request_principals):
+        """Test that ignore_username_query_param=True ignores the username query parameter."""
+        Principal.objects.create(username="other_user", tenant=self.tenant, user_id="other-uid")
+        self.principal.user_id = "principal-a-uid"
+        self.principal.save()
+
+        request = mock.Mock()
+        request.tenant = self.tenant
+        request.user = User()
+        request.user.username = self.principal.username
+        request.query_params = {"username": "other_user"}
+
+        result = get_principal_from_request(request=request, ignore_username_query_param=True)
+        self.assertEqual(result.username, self.principal.username)
+        mock_request_principals.assert_not_called()
+
+    @mock.patch(
+        "management.principal.proxy.PrincipalProxy.request_filtered_principals",
+        return_value={
+            "status_code": 200,
+            "data": [
+                {
+                    "org_id": "100001",
+                    "is_org_admin": False,
+                    "is_internal": False,
+                    "id": 52567473,
+                    "username": "other_user",
+                    "account_number": "1111111",
+                    "is_active": True,
+                }
+            ],
+        },
+    )
+    def test_get_principal_for_auth_helper(self, mock_request_principals):
+        """Test that get_principal_for_auth helper ignores the username query parameter."""
+        Principal.objects.create(username="other_user", tenant=self.tenant, user_id="other-uid")
+        self.principal.user_id = "principal-a-uid"
+        self.principal.save()
+
+        request = mock.Mock()
+        request.tenant = self.tenant
+        request.user = User()
+        request.user.username = self.principal.username
+        request.query_params = {"username": "other_user"}
+
+        result = get_principal_for_auth(request)
+        self.assertEqual(result.username, self.principal.username)
+        mock_request_principals.assert_not_called()
+
+    @mock.patch(
+        "management.principal.proxy.PrincipalProxy.request_filtered_principals",
+        return_value={
+            "status_code": 200,
+            "data": [
+                {
+                    "org_id": "100001",
+                    "is_org_admin": False,
+                    "is_internal": False,
+                    "id": 52567473,
+                    "username": "other_user",
+                    "account_number": "1111111",
+                    "is_active": True,
+                }
+            ],
+        },
+    )
+    def test_get_principal_from_request_default_uses_query_param(self, mock_request_principals):
+        """Test that default behavior still uses the username query parameter."""
+        Principal.objects.create(username="other_user", tenant=self.tenant, user_id="other-uid")
+
+        request = mock.Mock()
+        request.tenant = self.tenant
+        request.user = User()
+        request.user.username = self.principal.username
+        request.user.admin = True
+        request.query_params = {"username": "other_user"}
+
+        result = get_principal_from_request(request=request)
+        mock_request_principals.assert_called_once()
+        self.assertEqual(result.username, "other_user")
+
     def test_validate_and_get_key_success(self):
         """Test we can validate the query param value."""
         query_key = "type"
@@ -638,3 +738,95 @@ class SystemUserFromTokenTests(IdentityRequest):
         result_user = build_system_user_from_token(request, token_validator)
 
         self._assert_system_user_fields(result_user, existing_username)
+
+
+class ValidatePskTests(IdentityRequest):
+    """Test validate_psk uses constant-time comparison."""
+
+    PSK_CONFIG = {
+        "test-client": {"secret": "primary-secret-value", "alt-secret": "alt-secret-value"},
+        "no-alt-client": {"secret": "only-primary"},
+    }
+
+    @override_settings(SERVICE_PSKS=PSK_CONFIG)
+    def test_valid_primary_key(self):
+        """Test that a valid primary PSK returns True."""
+        self.assertTrue(validate_psk("primary-secret-value", "test-client"))
+
+    @override_settings(SERVICE_PSKS=PSK_CONFIG)
+    def test_valid_alt_key(self):
+        """Test that a valid alt PSK returns True."""
+        self.assertTrue(validate_psk("alt-secret-value", "test-client"))
+
+    @override_settings(SERVICE_PSKS=PSK_CONFIG)
+    def test_invalid_key(self):
+        """Test that an invalid PSK returns False."""
+        self.assertFalse(validate_psk("wrong-secret", "test-client"))
+
+    @override_settings(SERVICE_PSKS=PSK_CONFIG)
+    def test_unknown_client_id(self):
+        """Test that an unknown client_id returns False."""
+        self.assertFalse(validate_psk("primary-secret-value", "unknown-client"))
+
+    @override_settings(SERVICE_PSKS=PSK_CONFIG)
+    def test_none_psk(self):
+        """Test that None PSK does not raise and returns False."""
+        self.assertFalse(validate_psk(None, "test-client"))
+
+    @override_settings(SERVICE_PSKS=PSK_CONFIG)
+    def test_none_primary_key_in_config(self):
+        """Test that missing secret in config does not raise."""
+        config_with_none = {"partial-client": {}}
+        with override_settings(SERVICE_PSKS=config_with_none):
+            self.assertFalse(validate_psk("some-psk", "partial-client"))
+
+    @override_settings(SERVICE_PSKS={})
+    def test_empty_psks_config(self):
+        """Test that empty SERVICE_PSKS returns False."""
+        self.assertFalse(validate_psk("any-value", "any-client"))
+
+    @override_settings(SERVICE_PSKS=PSK_CONFIG)
+    def test_no_alt_secret_valid_primary(self):
+        """Test client with only primary secret, no alt-secret key."""
+        self.assertTrue(validate_psk("only-primary", "no-alt-client"))
+
+    @override_settings(SERVICE_PSKS=PSK_CONFIG)
+    def test_no_alt_secret_wrong_psk(self):
+        """Test client with only primary secret rejects wrong PSK."""
+        self.assertFalse(validate_psk("wrong", "no-alt-client"))
+
+    @override_settings(SERVICE_PSKS=PSK_CONFIG)
+    def test_empty_string_psk(self):
+        """Test that empty string PSK does not match real secrets."""
+        self.assertFalse(validate_psk("", "test-client"))
+        self.assertFalse(validate_psk("", "unknown-client"))
+
+    @override_settings(SERVICE_PSKS=PSK_CONFIG)
+    def test_non_ascii_psk(self):
+        """Test that non-ASCII PSK is rejected, not a TypeError."""
+        self.assertFalse(validate_psk("\u00e9\u00e8\u00ea", "test-client"))
+        self.assertFalse(validate_psk("\U0001f600", "test-client"))
+
+    @override_settings(SERVICE_PSKS=PSK_CONFIG)
+    def test_valid_psk_wrong_client_id(self):
+        """PSK valid for one client must not authenticate a different client."""
+        self.assertFalse(validate_psk("primary-secret-value", "no-alt-client"))
+
+    @override_settings(SERVICE_PSKS={"test-client": {"secret": "", "alt-secret": "real-key"}})
+    def test_empty_string_secret_in_config(self):
+        """Empty string secret in config should not match empty PSK."""
+        self.assertTrue(validate_psk("real-key", "test-client"))
+        self.assertFalse(validate_psk("", "test-client"))
+
+    @override_settings(SERVICE_PSKS=PSK_CONFIG)
+    def test_psk_type_mismatch_triggers_type_error(self):
+        """Verify that TypeError (e.g. bytes vs str) is caught and returns False."""
+        with (
+            mock.patch(
+                "management.utils.hmac.compare_digest",
+                side_effect=TypeError("type mismatch"),
+            ),
+            mock.patch("management.utils.logger.warning") as warning,
+        ):
+            self.assertFalse(validate_psk("some-psk", "test-client"))
+        warning.assert_called_once()

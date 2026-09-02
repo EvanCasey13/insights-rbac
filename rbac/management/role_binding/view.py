@@ -26,14 +26,12 @@ from management.permissions.role_binding_access import (
     RoleBindingSystemUserAccessPermission,
 )
 from management.permissions.v2_edit_api_access import V2WriteRequiresWorkspacesEnabled
-from management.role.v2_model import RoleV2
 from management.v2_mixins import AtomicOperationsMixin
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from api.common.pagination import V2CursorPagination
-from api.models import Tenant
 from .serializer import (
     BatchCreateRoleBindingRequestSerializer,
     BatchCreateRoleBindingResponseItemSerializer,
@@ -43,47 +41,11 @@ from .serializer import (
     RoleBindingOutputSerializer,
     UpdateRoleBindingRequestSerializer,
     UpdateRoleBindingResponseSerializer,
+    resolve_resource_identifiers,
 )
 from .service import RoleBindingService
 
 logger = logging.getLogger(__name__)
-
-
-class _BindingWithRole:
-    """Proxy that presents a RoleBinding with a different role.
-
-    Used to expand platform-role bindings into per-child-role entries
-    so the list endpoint returns concrete roles instead of abstract parents.
-    """
-
-    def __init__(self, binding, role):
-        self._binding = binding
-        self.role = role
-
-    def __getattr__(self, name):
-        return getattr(self._binding, name)
-
-
-def _expand_platform_roles(bindings):
-    """Replace platform-role bindings with one entry per child role.
-
-    Non-platform bindings pass through unchanged.  Platform bindings are
-    expanded: each child role produces a separate proxy entry that shares
-    the original binding's subject/resource data but overrides the role.
-
-    Note: this runs after pagination, so the actual number of items
-    returned may slightly exceed the requested page size when platform
-    roles are expanded into multiple children.  This is acceptable
-    because platform-role bindings are few (only default bindings).
-    """
-    expanded = []
-    for binding in bindings:
-        if binding.role and binding.role.type == RoleV2.Types.PLATFORM:
-            for child in binding.role.children.all():
-                expanded.append(_BindingWithRole(binding, child))
-        else:
-            expanded.append(binding)
-    return expanded
 
 
 class RoleBindingViewSet(AtomicOperationsMixin, BaseV2ViewSet):
@@ -165,11 +127,8 @@ class RoleBindingViewSet(AtomicOperationsMixin, BaseV2ViewSet):
         # Convert resource_tenant_org_id to resource_id before passing to service
         resource_id = validated_params.get("resource_id")
         resource_type = validated_params.get("resource_type")
-        resource_tenant_org_id = validated_params.get("resource_tenant_org_id")
-        if resource_tenant_org_id:
-            resource_id = Tenant.org_id_to_tenant_resource_id(resource_tenant_org_id)
-            resource_type = resource_type or "tenant"
-            # Update params so service uses converted values
+        if validated_params.get("resource_tenant_org_id"):
+            resource_type, resource_id = resolve_resource_identifiers(validated_params)
             validated_params = {**validated_params, "resource_id": resource_id, "resource_type": resource_type}
 
         service = RoleBindingService(tenant=request.tenant)
@@ -194,7 +153,6 @@ class RoleBindingViewSet(AtomicOperationsMixin, BaseV2ViewSet):
                 queryset = queryset.with_resource_names()
 
         page = self.paginate_queryset(queryset)
-        page = _expand_platform_roles(page)
 
         # Build context for output serializer
         context = {
@@ -227,6 +185,19 @@ class RoleBindingViewSet(AtomicOperationsMixin, BaseV2ViewSet):
             f"Created {len(created_bindings)} role binding(s) for {len(subjects)} subject(s)"
             f" on {len(resources)} resource(s)",
         )
+        # CREATE operation - SEC-MON-REQ-1 compliance (EOI-4 access_manipulation, EOI-1 pii_manipulation)
+        logger.info(
+            "Role bindings created",
+            extra={
+                "action": "CREATE",
+                "resource_type": "role_binding",
+                "resource_id": f"{len(created_bindings)}_bindings",
+                "outcome": "success",
+                "org_id": getattr(request.user, "org_id", None),
+                "username": getattr(request.user, "username", None),
+                "binding_count": len(created_bindings),
+            },
+        )
 
         fields = serializer.validated_data.get("fields")
         response_serializer = BatchCreateRoleBindingResponseItemSerializer(
@@ -248,9 +219,9 @@ class RoleBindingViewSet(AtomicOperationsMixin, BaseV2ViewSet):
     def _list_by_subject(self, request):
         """List role bindings grouped by subject.
 
-        Required query parameters:
-            - resource_id: Filter by resource ID
-            - resource_type: Filter by resource type
+        Required query parameters (one of):
+            - resource_id + resource_type: Filter by resource
+            - resource.tenant.org_id: Filter by tenant org ID (shorthand)
 
         Optional query parameters:
             - subject_type: Filter by subject type (e.g., 'group')
@@ -262,6 +233,10 @@ class RoleBindingViewSet(AtomicOperationsMixin, BaseV2ViewSet):
         input_serializer = RoleBindingInputSerializer(data=request.query_params)
         input_serializer.is_valid(raise_exception=True)
         validated_params = input_serializer.validated_data
+
+        if validated_params.get("resource_tenant_org_id"):
+            resource_type, resource_id = resolve_resource_identifiers(validated_params)
+            validated_params = {**validated_params, "resource_id": resource_id, "resource_type": resource_type}
 
         service = RoleBindingService(tenant=request.tenant)
 
@@ -290,6 +265,10 @@ class RoleBindingViewSet(AtomicOperationsMixin, BaseV2ViewSet):
         serializer.is_valid(raise_exception=True)
         result = serializer.save()
 
+        if result.custom_default_group_created is not None:
+            audit_log = AuditLog()
+            audit_log.log_create_from_object(request, AuditLog.GROUP, result.custom_default_group_created)
+
         subject_name = self._get_subject_name(result.subject, result.subject_type)
         resource_label = result.resource_name or result.resource_id
         self._log_audit(
@@ -297,6 +276,19 @@ class RoleBindingViewSet(AtomicOperationsMixin, BaseV2ViewSet):
             AuditLog.EDIT,
             f"Updated role bindings for {result.subject_type} '{subject_name}'"
             f" on {result.resource_type} '{resource_label}': {len(result.roles)} role(s) assigned",
+        )
+        # UPDATE operation - SEC-MON-REQ-1 compliance (EOI-4 access_manipulation, EOI-1 pii_manipulation)
+        logger.info(
+            "Role bindings updated",
+            extra={
+                "action": "UPDATE",
+                "resource_type": "role_binding",
+                "resource_id": f"{result.subject_type}_{str(result.subject.uuid)}",
+                "outcome": "success",
+                "org_id": getattr(request.user, "org_id", None),
+                "username": getattr(request.user, "username", None),
+                "role_count": len(result.roles),
+            },
         )
 
         response_context = {

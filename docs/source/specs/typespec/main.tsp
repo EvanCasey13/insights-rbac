@@ -78,7 +78,11 @@ model Role {
     permissions?: KesselRBAC.Permission[];
     @doc("Number of permissions assigned to this role")
     permissions_count?: int32;
+    @doc("Timestamp of when the role was created")
+    created?: offsetDateTime;
     @doc("Timestamp of when the role was last modified")
+    modified?: offsetDateTime;
+    @doc("Timestamp of when the role was last modified (deprecated, use modified)")
     last_modified?: offsetDateTime;
     @doc("ID of the organization that owns this role. Will not be populated if roles belong to the Public Tenant.")
     org_id?: string;
@@ -206,6 +210,12 @@ model OffsetPaginationLinks {
 namespace Problems {
     enum ProblemType {
         InsufficientPermission:"http://project-kessel.org/problems/insufficient-permission",
+        Unauthenticated:"http://project-kessel.org/problems/unauthenticated",
+        NotFound:"http://project-kessel.org/problems/not-found",
+        InternalError:"http://project-kessel.org/problems/internal-error",
+        InvalidRequest:"http://project-kessel.org/problems/invalid-request",
+        AlreadyExists:"http://project-kessel.org/problems/already-exists",
+        WorkspaceNotEmpty:"http://project-kessel.org/problems/workspace-not-empty",
     }
 
     @error
@@ -229,30 +239,45 @@ namespace Problems {
         title: "You do not have permission to perform this action.";
     }
 
-    alias Problem401 = ProblemDetails<Status = 401>;
+    @error
+    model Problem401 extends ProblemDetails<Status = 401>{
+        type: ProblemType.Unauthenticated,
+        title: "Authentication credentials were not provided or are invalid.";
+    }
 
     @error
     model Problem404 extends ProblemDetails<Status = 404>{
+        type: ProblemType.NotFound,
         title: "Resource was not found",
         @example("Not found")
         detail: string
     }
 
-    alias Problem500 = ProblemDetails<Status = 500>;
+    @error
+    model Problem500 extends ProblemDetails<Status = 500>{
+        type: ProblemType.InternalError,
+        title: "Unexpected error occurred.";
+    }
 
     @error
     model Problem400 extends ProblemDetails<Status = 400>{
+        type: ProblemType.InvalidRequest,
         title: "The request payload contains invalid syntax.",
         @example("JSON parse error - Expecting value: line 1 column 1 (char 0)")
         detail: string
     }
 
-    alias Problem400AlreadyExists = ProblemDetails<Status = 400>;
+    @error
+    model Problem400AlreadyExists extends ProblemDetails<Status = 400>{
+        type: ProblemType.AlreadyExists,
+        title: "The resource already exists.";
+    }
 
-    alias CommonProblems = Problem401 | Problem403 | Problem500;
+    alias CommonProblems = Problem400 | Problem401 | Problem403 | Problem500;
 
     namespace Workspace {
         model Problem400WorkspaceNotEmpty extends Problems.ProblemDetails<Status = 400>{
+            type: ProblemType.WorkspaceNotEmpty,
             title: "Unable to delete due to workspace dependencies",
         }
     }
@@ -504,8 +529,8 @@ namespace Workspaces {
               type: WorkspaceTypes.standard,
               name: "My first workspace",
               description: "This is a basic workspace.",
-              created: offsetDateTime.fromISO("2024-05-06T12:20-12-0700"),
-              modified: offsetDateTime.fromISO("2024-05-06T12:20-12-0700")
+              created: offsetDateTime.fromISO("2024-05-06T12:20:00-07:00"),
+              modified: offsetDateTime.fromISO("2024-05-06T12:20:00-07:00")
             }
           ]
         }
@@ -519,7 +544,7 @@ namespace Workspaces {
 
         @doc("Filter by workspace type. Supports comma-separated values (e.g. type=standard,ungrouped-hosts). Defaults to all when not supplied. Case-insensitive.")
         @query type?: string = "all";
-        @doc("Case sensitive exact match of workspace by name.")
+        @doc("Filter by workspace name. Case-insensitive substring match by default; use * for glob patterns (e.g. foo*).")
         @query name?: string;
         @doc("Filter workspaces by parent workspace UUID. Returns only direct children of the specified workspace. Useful for lazy-loading a nested tree structure.")
         @query parent_id?: UUID;
@@ -529,6 +554,10 @@ namespace Workspaces {
         @doc("Sort by specified field(s), prefix with '-' for descending order. Allowed fields: name, created, modified, type.")
         @example("-created")
         @query order_by?: string = "name";
+
+        @doc("When true, list responses include ancestor workspaces for tree navigation and fallback workspaces (root, default, ungrouped) when the user has no explicit access. When false (default), only workspaces with explicit Inventory permission are returned.")
+        @example(false)
+        @query with_ancestry?: boolean = false;
     ): WorkspaceListResponse | Problems.CommonProblems;
 
     @doc("Create workspace in tenant")
@@ -552,7 +581,7 @@ namespace Workspaces {
             }
       }
     )
-    @post op create(@body body: CreateWorkspaceRequest): CreateWorkspaceResponse | Problems.CommonProblems | Problems.Problem400;
+    @post op create(@body body: CreateWorkspaceRequest): CreateWorkspaceResponse | Problems.CommonProblems | Problems.Problem400AlreadyExists;
 
     @doc("Get a workspace in tenant")
     @summary("Get a workspace in tenant")
@@ -635,7 +664,7 @@ namespace Workspaces {
         @doc("Unique identification")
         @path id: UUID;
         @body body: UpdateWorkspaceRequest
-    ): UpdateWorkspaceResponse | Problems.CommonProblems | Problems.Problem400AlreadyExists ;
+    ): UpdateWorkspaceResponse | Problems.CommonProblems | Problems.Problem400AlreadyExists;
 
     @opExample(#{
         parameters: #{
@@ -663,7 +692,7 @@ namespace Workspaces {
         @doc("Unique identification")
         @path id: UUID;
         @body body: PatchWorkspaceRequest
-    ): PatchWorkspaceResponse | Problems.CommonProblems | Problems.Problem400AlreadyExists ;
+    ): PatchWorkspaceResponse | Problems.CommonProblems | Problems.Problem400AlreadyExists;
 
     @doc("Delete a workspace")
     @summary("Delete the workspace")
@@ -705,15 +734,92 @@ namespace Workspaces {
         @body body: MoveWorkspaceRequest
     ): MoveWorkspaceResponse
       | Problems.CommonProblems
-      | Problems.Problem400
       | Problems.Problem404;
+
+    @example(#{
+        ids: #[
+            "e4277742-b91c-43f1-a185-b827e8574345",
+            "c1f729e2-3e2b-4f9e-b247-a4b568393e11"
+        ]
+    })
+    model WorkspaceQueryRequest {
+        @doc("List of workspace UUIDs to filter by.")
+        @minItems(1)
+        @maxItems(3000)
+        ids: UUID[];
+
+        @doc("Filter by workspace type. Supports comma-separated values (e.g. standard,ungrouped-hosts). Defaults to standard when ids are provided without explicit type.")
+        @maxLength(200)
+        type?: string;
+
+        @doc("Filter by workspace name. Case-insensitive substring match by default; use * for glob patterns.")
+        name?: string;
+
+        @doc("Filter by parent workspace UUID.")
+        parent_id?: UUID;
+
+        @doc("Include ancestor and fallback workspaces in the response.")
+        with_ancestry?: boolean = false;
+    }
+
+    @doc("Query workspaces by a list of IDs")
+    @summary("Query workspaces by a list of IDs")
+    @route("query/")
+    @opExample(#{
+        parameters: #{
+            limit: 10,
+            offset: 0,
+            body: #{
+                ids: #[
+                    "e4277742-b91c-43f1-a185-b827e8574345",
+                    "c1f729e2-3e2b-4f9e-b247-a4b568393e11"
+                ],
+                type: "standard"
+            }
+        },
+        returnType: #{
+            meta: #{
+                count: 2,
+                limit: 10,
+                offset: 0
+            },
+            links: #{
+                first: "/api/rbac/v2/workspaces/query/?limit=10&offset=0",
+                next: null,
+                previous: null,
+                last: "/api/rbac/v2/workspaces/query/?limit=10&offset=0"
+            },
+            data: #[
+                #{
+                    id: "e4277742-b91c-43f1-a185-b827e8574345",
+                    parent_id: "c1f729e2-3e2b-4f9e-b247-a4b568393e11",
+                    type: WorkspaceTypes.standard,
+                    name: "My first workspace",
+                    description: "This is a basic workspace.",
+                    created: offsetDateTime.fromISO("2024-05-06T12:20:00-07:00"),
+                    modified: offsetDateTime.fromISO("2024-05-06T12:20:00-07:00")
+                }
+            ]
+        }
+    })
+    @post op query(
+        @query limit?: Limit = DefaultLimit;
+
+        @doc("Offset for offset-based pagination.")
+        @query offset?: Offset = DefaultOffset;
+
+        @doc("Sort by specified field(s), prefix with '-' for descending order. Allowed fields: name, created, modified, type.")
+        @query order_by?: string = "name";
+
+        @body body: WorkspaceQueryRequest;
+    ): WorkspaceListResponse | Problems.CommonProblems;
 }
 
 @route("/role-bindings/")
 @tag("Role Bindings")
 @doc("Operations about role bindings")
 namespace RoleBindings {
-    const DefaultRoleBindingBySubjectFieldMask: FieldMask = "resource(id),subject(id,type),roles(id)";
+    const DefaultRoleBindingBySubjectFieldMask: FieldMask = "resource(id),subject(id,type),roles(id,created,modified)";
 
     @doc("Subject kind for create/batch, by-subject, and list filters on the binding's subject (group UUID or user/principal UUID). Does not include principal as a separate type string; for external user ID use GET /role-bindings/ with granted_subject_type=principal and granted_subject.principal.user_id.")
     enum BindingSubjectType {
@@ -770,7 +876,7 @@ namespace RoleBindings {
 
     model Resource {
         @doc("Resource identifier")
-        id?: UUID;
+        id?: string;
         @doc("Resource name")
         name?: string;
         @doc("Resource type")
@@ -784,11 +890,16 @@ namespace RoleBindings {
         subject: #{ id: "3fa85f64-5717-4562-b3fc-2c963f66afa6", type: BindingSubjectType.group },
         role: #{ id: "550e8400-e29b-41d4-a716-446655440002" }
     })
+    @example(#{
+        resource: #{ id: "redhat/12345", type: "tenant" },
+        subject: #{ id: "3fa85f64-5717-4562-b3fc-2c963f66afa6", type: BindingSubjectType.group },
+        role: #{ id: "550e8400-e29b-41d4-a716-446655440002" }
+    })
     model CreateRoleBindingsRequest {
         @doc("Resource to bind the role to")
         resource: {
-            @doc("UUID that uniquely identifies the resource")
-            id: UUID;
+            @doc("Identifier of the resource")
+            id: string;
             @doc("Type of resource")
             @example("workspace")
             type: string;
@@ -1004,12 +1115,16 @@ namespace RoleBindings {
         @doc("Cursor for cursor-based pagination.")
         @query cursor?: Cursor;
 
-        @doc("Filter by resource ID. For workspace: UUID. For tenant: tenant resource ID (format: {domain}/{org_id}).")
+        @doc("Filter by resource ID. For workspace: UUID. For tenant: tenant resource ID (format: {domain}/{org_id}). Required unless resource.tenant.org_id is provided.")
         @example("550e8400-e29b-41d4-a716-446655440001")
-        @query resource_id: string;
-        @doc("Filter by resource type")
+        @query resource_id?: string;
+        @doc("Filter by resource type. Required unless resource.tenant.org_id is provided.")
         @example(ResourceType.workspace)
-        @query resource_type: ResourceType;
+        @query resource_type?: ResourceType;
+
+        @doc("Org ID of the tenant resource to filter by. Cannot be combined with resource_id. When provided, resource_type is implicitly 'tenant'.")
+        @example("12345678")
+        @query("resource.tenant.org_id") resource_tenant_org_id?: string;
         @doc("Filter by binding subject kind: group or user (principal UUID). There is no granted_subject.* on this endpoint.")
         @example(BindingSubjectType.group)
         @query subject_type?: BindingSubjectType;
@@ -1064,9 +1179,9 @@ namespace RoleBindings {
         }
     })
     @post op batchCreate(
-        @query fields?: FieldMask = "resource(id),role(id),subject(id,type)";
+        @query fields?: FieldMask = "resource(id,type),role(id),subject(id,type)";
         @body body: BatchCreateRoleBindingsRequest;
-    ): BatchCreateRoleBindingsResponse | Problems.CommonProblems | Problems.Problem400;
+    ): BatchCreateRoleBindingsResponse | Problems.CommonProblems;
 
     @doc("Request body for updating role bindings - contains the new roles to assign")
     @example(#{
@@ -1110,13 +1225,17 @@ namespace RoleBindings {
         }
     })
     @put op update(
-        @doc("Identify the resource ID for the set of role bindings to replace. For workspace: UUID. For tenant: tenant resource ID (format: {domain}/{org_id}).")
+        @doc("Identify the resource ID for the set of role bindings to replace. For workspace: UUID. For tenant: tenant resource ID (format: {domain}/{org_id}). Required unless resource.tenant.org_id is provided.")
         @example("550e8400-e29b-41d4-a716-446655440001")
-        @query resource_id: string;
+        @query resource_id?: string;
 
-        @doc("Identify the resource type for the set of role bindings to replace")
+        @doc("Identify the resource type for the set of role bindings to replace. Required unless resource.tenant.org_id is provided.")
         @example(ResourceType.workspace)
-        @query resource_type: ResourceType;
+        @query resource_type?: ResourceType;
+
+        @doc("Org ID of the tenant resource. Cannot be combined with resource_id. When provided, resource_type is implicitly 'tenant'.")
+        @example("12345678")
+        @query("resource.tenant.org_id") resource_tenant_org_id?: string;
 
         @doc("Identify the subject ID for the set of role bindings to replace")
         @example("550e8400-e29b-41d4-a716-446655440004")
@@ -1129,7 +1248,7 @@ namespace RoleBindings {
         @body body: UpdateRoleBindingsRequest;
 
         @query fields?: FieldMask = DefaultRoleBindingBySubjectFieldMask;
-    ): ItemResponse<RoleBindingBySubject, 200> | Problems.CommonProblems | Problems.Problem400 | Problems.Problem404;
+    ): ItemResponse<RoleBindingBySubject, 200> | Problems.CommonProblems | Problems.Problem404;
 
     @example(#{
         role: #{
@@ -1277,7 +1396,7 @@ namespace RoleBindings {
         @query("granted_subject.principal.user_id") granted_subject_principal_user_id?: string;
 
         @doc("Control which fields are included in the response to optimize payload size.")
-        @query fields?: FieldMask = "resource(id),role(id),subject(id,type),sources(id)";
+        @query fields?: FieldMask = "resource(id),role(id,created,modified),subject(id,type),sources(id)";
 
         @doc("Default sort is by the time the role was first created. Prefix with '-' for descending order.")
         @query order_by?: OrderBy = "role.id";
@@ -1373,17 +1492,23 @@ namespace Roles {
         @doc("Cursor for cursor-based pagination.")
         @query cursor?: Cursor;
 
-        @doc("Filter by role name. Exact match by default; use * as a wildcard for partial matching (e.g. foo*).")
+        @doc("Filter by role name. Case-insensitive substring match by default; use * for glob patterns (e.g. foo*).")
         @query name?: string;
 
         @doc("Filter roles by the resource type (e.g. 'tenant', 'workspace'). When omitted, returns roles from all scopes.")
         @query resource_type?: string;
 
-        @doc("Filter by resource ID. Requires resource_type to be specified.")
+        @doc("Filter by resource ID. For workspace: UUID. For tenant: tenant resource ID (format: {domain}/{org_id}). Requires resource_type unless resource.tenant.org_id is provided.")
         @query resource_id?: string;
+
+        @doc("Org ID of the tenant resource to filter by. Cannot be combined with resource_id. When provided, resource_type is implicitly 'tenant'.")
+        @query("resource.tenant.org_id") resource_tenant_org_id?: string;
 
         @doc("Control which fields are included in the response to optimize payload size.")
         @query fields?: FieldMask = "id,name,description,last_modified";
+
+        @doc("Filter by permission string(s). Comma-separated exact match (e.g. 'inventory:hosts:read' or 'inventory:hosts:read,rbac:workspace:write').")
+        @query permission?: string;
 
         @doc("Sort by specified field(s), prefix with '-' for descending order. Allowed fields: name, last_modified.")
         @query order_by?: OrderBy = "name";
@@ -1431,7 +1556,7 @@ namespace Roles {
         """)
         @example("id,name,permissions_count")
         @query fields?: string = DefaultRoleFieldMask;
-    ): ItemResponse<Role, 201> | Problems.CommonProblems | Problems.Problem400;
+    ): ItemResponse<Role, 201> | Problems.CommonProblems;
 
 
 
@@ -1505,7 +1630,7 @@ namespace Roles {
 
         @doc("Control which fields are included in the response to optimize payload size.")
         @query fields?: FieldMask = DefaultRoleFieldMask;
-    ): ItemResponse<Role, 200> | Problems.CommonProblems | Problems.Problem400 | Problems.Problem404;
+    ): ItemResponse<Role, 200> | Problems.CommonProblems | Problems.Problem404;
 
     @doc("Data for request to delete multiple roles by ID.")
     model BatchDeleteRolesRequest {
@@ -1536,7 +1661,127 @@ namespace Roles {
     })
     @post op batchDelete(
         @body body: BatchDeleteRolesRequest
-    ): BatchDeleteRolesResponse | Problems.CommonProblems | Problems.Problem400 | Problems.Problem404;
+    ): BatchDeleteRolesResponse | Problems.CommonProblems | Problems.Problem404;
+}
+
+@doc("Principal type")
+enum PrincipalType {
+    user,
+    @doc("Service account principal")
+    `service-account`,
+}
+
+@example(#{
+    uuid: "550e8400-e29b-41d4-a716-446655440002",
+    username: "jdoe",
+    type: PrincipalType.user,
+    user_id: "12345",
+    service_account_id: null,
+    group_count: 3
+})
+model Principal {
+    @doc("UUID that uniquely identifies the principal")
+    uuid: UUID;
+    @doc("Username of the principal")
+    username: string;
+    @doc("Type of the principal: user or service-account")
+    type: PrincipalType;
+    @doc("External user ID. Null for service accounts.")
+    user_id: string | null;
+    @doc("Service account client ID. Null for users.")
+    service_account_id: string | null;
+    @doc("Number of groups the principal belongs to")
+    @minValue(0)
+    group_count: int32;
+}
+
+model PrincipalListResponse {
+    @statusCode _: 200;
+    meta: OffsetPaginationMeta;
+    links: OffsetPaginationLinks;
+    data: Principal[];
+}
+
+@route("/principals/")
+@tag("Principals")
+@doc("Operations about principals")
+namespace Principals {
+
+    @doc("List the principals for a tenant")
+    @summary("List the principals for a tenant")
+    @opExample(#{
+        parameters: #{
+            limit: 10
+        },
+        returnType: #{
+            _: 200,
+            meta: #{
+                count: 2,
+                limit: 10,
+                offset: 0
+            },
+            links: #{
+                first: "/api/rbac/v2/principals/?limit=10&offset=0",
+                next: null,
+                previous: null,
+                last: "/api/rbac/v2/principals/?limit=10&offset=0"
+            },
+            data: #[
+                #{
+                    uuid: "550e8400-e29b-41d4-a716-446655440002",
+                    username: "jdoe",
+                    type: PrincipalType.user,
+                    user_id: "12345",
+                    service_account_id: null,
+                    group_count: 3
+                },
+                #{
+                    uuid: "660e8400-e29b-41d4-a716-446655440003",
+                    username: "service-account-abc123",
+                    type: PrincipalType.`service-account`,
+                    user_id: null,
+                    service_account_id: "abc123",
+                    group_count: 1
+                }
+            ]
+        }
+    })
+    @get op list(
+        @query limit?: Limit = DefaultLimit;
+
+        @query offset?: Offset = DefaultOffset;
+
+        @doc("Filter by username. Case-insensitive substring match by default; use * for glob patterns (e.g. jd*).")
+        @query username?: string;
+
+        @doc("Filter by principal type: user or service-account.")
+        @query type?: PrincipalType;
+
+        @doc("Sort by specified field, prefix with '-' for descending order. Allowed fields: username.")
+        @query order_by?: OrderBy;
+    ): PrincipalListResponse | Problems.CommonProblems;
+
+
+    @route("{uuid}/")
+    @doc("Retrieve a single principal by UUID")
+    @summary("Retrieve a single principal by UUID")
+    @opExample(#{
+        parameters: #{
+            uuid: "550e8400-e29b-41d4-a716-446655440002"
+        },
+        returnType: #{
+            _: 200,
+            uuid: "550e8400-e29b-41d4-a716-446655440002",
+            username: "jdoe",
+            type: PrincipalType.user,
+            user_id: "12345",
+            service_account_id: null,
+            group_count: 3
+        }
+    })
+    @get op read(
+        @path uuid: UUID;
+    ): ItemResponse<Principal, 200> | Problems.CommonProblems | Problems.Problem404;
 }
 
 @route("/permissions/")

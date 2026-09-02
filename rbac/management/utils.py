@@ -16,6 +16,7 @@
 #
 """Helper utilities for management module."""
 
+import hmac
 import logging
 import os
 import re
@@ -118,14 +119,23 @@ def create_client_channel_relation(addr):
 
 
 def validate_psk(psk, client_id):
-    """Validate the PSK for the client."""
+    """Validate the PSK for the client using constant-time comparison."""
     psks = settings.SERVICE_PSKS
     client_config = psks.get(client_id, {})
-    primary_key = client_config.get("secret")
-    alt_key = client_config.get("alt-secret")
+    primary_key = client_config.get("secret") or ""
+    alt_key = client_config.get("alt-secret") or ""
+    has_primary_key = bool(primary_key)
+    has_alt_key = bool(alt_key)
+    psk = psk or ""
 
     if psks:
-        return psk == primary_key or psk == alt_key
+        try:
+            primary_match = hmac.compare_digest(psk, primary_key)
+            alt_match = hmac.compare_digest(psk, alt_key)
+        except TypeError as e:
+            logger.warning("PSK validation TypeError for client_id=%s: %s", client_id, e)
+            return False
+        return (has_primary_key and primary_match) or (has_alt_key and alt_match)
 
     return False
 
@@ -266,20 +276,47 @@ def build_system_user_from_token(request, token_validator: TokenValidator) -> Op
         return None
 
 
-def get_principal_from_request(request):
-    """Obtain principal from the request object."""
+def get_principal_from_request(request, *, ignore_username_query_param=False):
+    """Obtain principal from the request object.
+
+    Args:
+        request: The HTTP request object
+        ignore_username_query_param: If True, ignore the username query parameter and always
+                                     use request.user.username. This should be True for
+                                     authorization checks to prevent privilege confusion.
+
+    Returns:
+        Principal object for the resolved username
+    """
     current_user = request.user.username
-    qs_user = request.query_params.get(USERNAME_KEY)
     username = current_user
     from_query = False
-    if qs_user and not PRINCIPAL_PERMISSION_INSTANCE.has_permission(request=request, view=None):
-        raise PermissionDenied()
 
-    if qs_user:
-        username = qs_user
-        from_query = True
+    if not ignore_username_query_param:
+        qs_user = request.query_params.get(USERNAME_KEY)
+        if qs_user and not PRINCIPAL_PERMISSION_INSTANCE.has_permission(request=request, view=None):
+            raise PermissionDenied()
+        if qs_user:
+            username = qs_user
+            from_query = True
 
-    return get_principal(username, request, verify_principal=bool(qs_user), from_query=from_query)
+    return get_principal(username, request, verify_principal=from_query, from_query=from_query)
+
+
+def get_principal_for_auth(request):
+    """Get principal from request for authorization purposes.
+
+    This helper ensures the principal is resolved from the authenticated user
+    (request.user.username) and never from a query parameter, preventing
+    privilege confusion in authorization checks.
+
+    Args:
+        request: The HTTP request object
+
+    Returns:
+        Principal object for the authenticated user
+    """
+    return get_principal_from_request(request, ignore_username_query_param=True)
 
 
 def get_principal(
@@ -542,6 +579,11 @@ def clean_query_param(value, param_name):
     return value
 
 
+def normalize_blank_or_none(value: str | None) -> str | None:
+    """Return None for empty/blank strings, pass through otherwise."""
+    return (value and value.strip()) or None
+
+
 def validate_uuid(uuid, key="UUID Validation"):
     """Verify UUID provided is valid."""
     try:
@@ -638,9 +680,28 @@ PROBLEM_TITLES = {
     500: "Unexpected error occurred.",
 }
 
+# RFC 9457 problem type URIs matching the TypeSpec ProblemType enum.
+# Each URI identifies a specific problem category for machine-readable error handling.
+PROBLEM_TYPES = {
+    400: "http://project-kessel.org/problems/invalid-request",
+    401: "http://project-kessel.org/problems/unauthenticated",
+    403: "http://project-kessel.org/problems/insufficient-permission",
+    404: "http://project-kessel.org/problems/not-found",
+    500: "http://project-kessel.org/problems/internal-error",
+}
 
-def v2response_error_from_errors(errors, exc=None, context=None):
-    """Build a ProblemDetails-formatted error response from errors."""
+
+def v2response_error_from_errors(errors, exc=None, context=None, problem_type=None):
+    """Build a ProblemDetails-formatted error response from errors.
+
+    Args:
+        errors: List of error dicts with "detail", "status", and optional "source" keys.
+        exc: The original exception (optional).
+        context: DRF context dict with "request" (optional).
+        problem_type: Explicit RFC 9457 problem type URI override. When set, this
+            takes precedence over the default status-code-based lookup in PROBLEM_TYPES.
+            Use for specialized problem types like "http://project-kessel.org/problems/already-exists".
+    """
     detail = ""
     status_code = 0
     field_errors = []
@@ -656,11 +717,16 @@ def v2response_error_from_errors(errors, exc=None, context=None):
                     field_error["field"] = error["source"]
                 field_errors.append(field_error)
 
+    resolved_type = problem_type or PROBLEM_TYPES.get(status_code)
+
     response = {
         "status": status_code,
         "title": PROBLEM_TITLES.get(status_code, "An error occurred."),
         "detail": detail,
     }
+
+    if resolved_type:
+        response["type"] = resolved_type
 
     if field_errors:
         response["errors"] = field_errors

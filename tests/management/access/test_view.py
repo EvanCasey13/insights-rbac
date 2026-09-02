@@ -16,23 +16,21 @@
 #
 """Test the access view."""
 
-from unittest.mock import patch, Mock
+from datetime import timedelta
+from unittest.mock import Mock, patch
 
-from api.models import CrossAccountRequest
+from django.test.utils import override_settings
 from django.urls import reverse
 from django.utils import timezone
-from django.test.utils import override_settings
-from rest_framework import status
-from rest_framework.test import APIClient
-
-from api.models import Tenant, User
-from datetime import timedelta
-
 from management.cache import TenantCache
-from management.models import Group, Permission, Principal, ResourceDefinition, Policy, Role, Access, Workspace
+from management.models import Access, Group, Permission, Policy, Principal, ResourceDefinition, Role, Workspace
 from management.relation_replicator.noop_replicator import NoopReplicator
 from management.tenant_service.v2 import V2TenantBootstrapService
+from rest_framework import status
+from rest_framework.test import APIClient
 from tests.identity_request import IdentityRequest
+
+from api.models import CrossAccountRequest, Tenant, User
 
 
 class AccessViewTests(IdentityRequest):
@@ -188,8 +186,11 @@ class AccessViewTests(IdentityRequest):
         return role
 
     @override_settings(ROLE_CREATE_ALLOW_LIST="app")
-    def test_get_access_success(self):
+    @patch("management.access.view.is_v2_access_check_required_for_request", return_value=False)
+    def test_get_access_success(self, _mock_v2):
         """Test that we can obtain the expected access without pagination."""
+        from management.access.view import v1_access_by_v2_org_total
+
         role_name = "roleA"
         response = self.create_role(role_name, headers=self.headers)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -204,6 +205,9 @@ class AccessViewTests(IdentityRequest):
         # Test that we can retrieve the principal access
         url = "{}?application={}".format(reverse("v1_management:access"), "app")
         client = APIClient()
+        before = v1_access_by_v2_org_total.labels(
+            org_id=self.customer_data["org_id"], application="app", caller_type="user"
+        )._value.get()
         response = client.get(url, **self.headers)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIsNotNone(response.data.get("data"))
@@ -211,6 +215,10 @@ class AccessViewTests(IdentityRequest):
         self.assertEqual(len(response.data.get("data")), 2)
         self.assertEqual(response.data.get("meta").get("limit"), 2)
         self.assertEqual(self.access_data, response.data.get("data")[0])
+        after = v1_access_by_v2_org_total.labels(
+            org_id=self.customer_data["org_id"], application="app", caller_type="user"
+        )._value.get()
+        self.assertEqual(after, before)
 
         # the platform default permission could also be retrieved
         url = "{}?application={}".format(reverse("v1_management:access"), "default")
@@ -533,7 +541,6 @@ class AccessViewTests(IdentityRequest):
         Access.objects.create(role=system_role, permission=assigned_permission, tenant=self.tenant)
 
         cross_account_request = CrossAccountRequest.objects.create(
-            target_account=account_id,
             user_id=user_id,
             target_org=org_id,
             end_date=timezone.now() + timedelta(10),
@@ -578,7 +585,6 @@ class AccessViewTests(IdentityRequest):
         ## This CAR will provide permission: "test:assigned:permission"
         role = self.create_role_and_permission("Test Role one", "test:assigned:permission1", True)
         cross_account_request = CrossAccountRequest.objects.create(
-            target_account=account_id,
             user_id=user_id,
             target_org=org_id,
             end_date=timezone.now() + timedelta(10),
@@ -588,7 +594,6 @@ class AccessViewTests(IdentityRequest):
         ## CAR below will provide permission: "app:*:*"
         role = self.create_role_and_permission("Test Role two", "test:assigned:permission2", True)
         cross_account_request = CrossAccountRequest.objects.create(
-            target_account=account_id,
             user_id=user_id,
             target_org=org_id,
             end_date=timezone.now() + timedelta(20),
@@ -1288,7 +1293,7 @@ class AccessViewTests(IdentityRequest):
 
     @override_settings(ROLE_CREATE_ALLOW_LIST="legacy_app,other_app")
     @override_settings(V2_MIGRATION_APP_EXCLUDE_LIST=["legacy_app"])
-    @patch("management.access.view.is_v2_edit_enabled_for_request", return_value=True)
+    @patch("management.access.view.is_v2_access_check_required_for_request", return_value=True)
     def test_access_v2_tenant_allowed_app_returns_data(self, _mock_v2):
         """V2 orgs can query /access for applications in V2_MIGRATION_APP_EXCLUDE_LIST."""
         perm_legacy = Permission.objects.create(permission="legacy_app:*:*", tenant=self.tenant)
@@ -1299,35 +1304,68 @@ class AccessViewTests(IdentityRequest):
         policy.group = self.group
         policy.save()
 
+        from management.access.view import v1_access_by_v2_org_total
+
         client = APIClient()
         url = f"{reverse('v1_management:access')}?application=legacy_app"
+        before = v1_access_by_v2_org_total.labels(
+            org_id=self.customer_data["org_id"], application="legacy_app", caller_type="user"
+        )._value.get()
         response = client.get(url, **self.headers)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         permissions = [row["permission"] for row in response.data.get("data", [])]
         self.assertIn("legacy_app:*:*", permissions)
+        after = v1_access_by_v2_org_total.labels(
+            org_id=self.customer_data["org_id"], application="legacy_app", caller_type="user"
+        )._value.get()
+        self.assertEqual(after, before)
 
     @override_settings(V2_MIGRATION_APP_EXCLUDE_LIST=["legacy_app"])
-    @patch("management.access.view.is_v2_edit_enabled_for_request", return_value=True)
-    def test_access_v2_tenant_disallowed_app_rejected(self, _mock_v2):
+    @patch("management.access.view.logger")
+    @patch("management.access.view.is_v2_access_check_required_for_request", return_value=True)
+    def test_access_v2_tenant_disallowed_app_rejected(self, _mock_v2, mock_log):
         """V2 orgs are rejected when querying an app not in V2_MIGRATION_APP_EXCLUDE_LIST."""
+        from management.access.view import v1_access_by_v2_org_total
+
         client = APIClient()
         url = f"{reverse('v1_management:access')}?application=other_app"
+        before = v1_access_by_v2_org_total.labels(
+            org_id=self.customer_data["org_id"], application="other_app", caller_type="user"
+        )._value.get()
         response = client.get(url, **self.headers)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("Disallowed", response.data.get("detail", ""))
+        mock_log.info.assert_called_once()
+        log_msg = mock_log.info.call_args[0][0] % mock_log.info.call_args[0][1:]
+        self.assertIn("result=rejected", log_msg)
+        self.assertIn(str(self.tenant.org_id), log_msg)
+        self.assertIn("other_app", log_msg)
+        after = v1_access_by_v2_org_total.labels(
+            org_id=self.customer_data["org_id"], application="other_app", caller_type="user"
+        )._value.get()
+        self.assertEqual(after, before + 1)
 
     @override_settings(V2_MIGRATION_APP_EXCLUDE_LIST=["legacy_app"])
-    @patch("management.access.view.is_v2_edit_enabled_for_request", return_value=True)
+    @patch("management.access.view.is_v2_access_check_required_for_request", return_value=True)
     def test_access_v2_tenant_empty_application_rejected(self, _mock_v2):
         """V2 orgs are rejected when application= is empty."""
+        from management.access.view import v1_access_by_v2_org_total
+
         client = APIClient()
         url = f"{reverse('v1_management:access')}?application="
+        before = v1_access_by_v2_org_total.labels(
+            org_id=self.customer_data["org_id"], application="", caller_type="user"
+        )._value.get()
         response = client.get(url, **self.headers)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("must specify", response.data.get("detail", ""))
+        after = v1_access_by_v2_org_total.labels(
+            org_id=self.customer_data["org_id"], application="", caller_type="user"
+        )._value.get()
+        self.assertEqual(after, before + 1)
 
     @override_settings(V2_MIGRATION_APP_EXCLUDE_LIST=["legacy_app"])
-    @patch("management.access.view.is_v2_edit_enabled_for_request", return_value=True)
+    @patch("management.access.view.is_v2_access_check_required_for_request", return_value=True)
     def test_access_v2_tenant_mixed_apps_rejected(self, _mock_v2):
         """V2 orgs are rejected when application param contains any disallowed app."""
         client = APIClient()
@@ -1335,3 +1373,40 @@ class AccessViewTests(IdentityRequest):
         response = client.get(url, **self.headers)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("other_app", response.data.get("detail", ""))
+
+    @override_settings(V2_MIGRATION_APP_EXCLUDE_LIST=["legacy_app"])
+    @patch("management.access.view.logger")
+    @patch("management.access.view.is_v2_access_check_required_for_request", return_value=True)
+    def test_access_v2_org_metric_logs_context(self, _mock_v2, mock_logger):
+        """Test that a structured log line is emitted when a v2 org is rejected from v1 /access."""
+        client = APIClient()
+        url = f"{reverse('v1_management:access')}?application=other_app"
+        response = client.get(url, **self.headers, HTTP_USER_AGENT="insights-chrome/1.0")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        mock_logger.info.assert_called_once()
+        log_msg = mock_logger.info.call_args[0][0] % mock_logger.info.call_args[0][1:]
+        self.assertIn("result=rejected", log_msg)
+        self.assertIn(self.customer_data["org_id"], log_msg)
+        self.assertIn("other_app", log_msg)
+        self.assertIn("caller_type=user", log_msg)
+        self.assertIn("user_id=", log_msg)
+        self.assertIn("request_id=", log_msg)
+        self.assertIn("user_agent=insights-chrome/1.0", log_msg)
+
+    @override_settings(V2_MIGRATION_APP_EXCLUDE_LIST=["legacy_app"])
+    @patch("management.access.view.is_v2_access_check_required_for_request", return_value=True)
+    def test_access_v2_org_metric_service_account_caller_type(self, _mock_v2):
+        """Test that the metric labels caller_type as service_account for service account requests."""
+        from management.access.view import v1_access_by_v2_org_total
+
+        client = APIClient()
+        url = f"{reverse('v1_management:access')}?application=other_app"
+        before = v1_access_by_v2_org_total.labels(
+            org_id=self.customer_data["org_id"], application="other_app", caller_type="service_account"
+        )._value.get()
+        response = client.get(url, **self.headers_service_account)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        after = v1_access_by_v2_org_total.labels(
+            org_id=self.customer_data["org_id"], application="other_app", caller_type="service_account"
+        )._value.get()
+        self.assertEqual(after, before + 1)

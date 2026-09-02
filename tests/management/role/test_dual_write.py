@@ -16,12 +16,16 @@
 #
 """Test tuple changes for RBAC operations."""
 
-from datetime import datetime, timedelta
-from typing import Callable, Optional, Tuple, Iterable
-from django.test import TestCase, override_settings
-from django.db.models import Q
-from django.conf import settings
+import logging
+from contextlib import contextmanager
+from datetime import timedelta
+from typing import Callable, Iterable, Optional, Tuple
+from unittest.mock import patch
 
+from django.conf import settings
+from django.db.models import Q
+from django.test import TestCase, override_settings
+from django.utils import timezone
 from management.group.definer import seed_group, set_system_flag_before_update
 from management.group.model import Group
 from management.group.platform import GlobalPolicyIdService
@@ -54,11 +58,10 @@ from management.role.relation_api_dual_write_handler import (
 from management.role.v2_model import CustomRoleV2, RoleV2, SeededRoleV2
 from management.role_binding.model import RoleBinding, RoleBindingPrincipal
 from management.role_binding.service import RoleBindingService
-from management.tenant_mapping.model import TenantMapping, DefaultAccessType
+from management.tenant_mapping.model import DefaultAccessType, TenantMapping
 from management.tenant_mapping.v2_activation import ensure_v2_write_activated
-from management.tenant_service.tenant_service import BootstrappedTenant
+from management.tenant_service.tenant_service import BootstrappedTenant, TenantBootstrapService
 from management.tenant_service.v2 import V2TenantBootstrapService
-from management.tenant_service.tenant_service import TenantBootstrapService
 from migration_tool.in_memory_tuples import (
     InMemoryRelationReplicator,
     InMemoryTuples,
@@ -71,7 +74,10 @@ from migration_tool.in_memory_tuples import (
     subject,
     subject_type,
 )
+from migration_tool.models import V2boundresource
 from migration_tool.utils import create_relationship
+from tests.util import assert_v1_v2_locally_consistent, assert_v1_v2_tuples_fully_consistent
+from tests.v2_util import bootstrap_tenant_for_v2_test, seed_v2_role_from_v1
 
 from api.cross_access.model import CrossAccountRequest
 from api.cross_access.relation_api_dual_write_cross_access_handler import (
@@ -79,11 +85,21 @@ from api.cross_access.relation_api_dual_write_cross_access_handler import (
 )
 from api.cross_access.util import create_cross_principal
 from api.models import Tenant, User
-from unittest.mock import patch
 
-from migration_tool.models import V2boundresource
-from tests.util import assert_v1_v2_locally_consistent, assert_v1_v2_tuples_fully_consistent
-from tests.v2_util import seed_v2_role_from_v1, bootstrap_tenant_for_v2_test
+
+@contextmanager
+def enable_logging():
+    """Re-enable logging temporarily for assertLogs in parallel test runner.
+
+    Django's parallel test runner disables low-level logs via logging.disable().
+    This context manager restores logging within its scope and resets afterward.
+    """
+    prior_disable = logging.root.manager.disable
+    logging.disable(logging.NOTSET)
+    try:
+        yield
+    finally:
+        logging.disable(prior_disable)
 
 
 @override_settings(REPLICATION_TO_RELATION_ENABLED=True)
@@ -548,6 +564,8 @@ class DualWriteTestCase(TestCase):
         )
 
         self.assertIn(group_id, mapping.mappings["groups"])
+        self.assertIsNotNone(mapping.v2_role, "BindingMapping should have v2_role set during dual-write")
+        self.assertEqual(str(mapping.v2_role.uuid), v2_role_id)
 
         binding = RoleBinding.objects.get(
             resource_type=target.resource_type[1],
@@ -1004,30 +1022,38 @@ class DualWriteGroupTestCase(DualWriteTestCase):
                 self.expect_binding_absent(tenant, v2_role_id=role_id, group_id=group_id)
 
     def test_custom_role_scope(self):
-        """Test that custom roles are bound in the correct scope."""
+        """Test that custom roles with mixed TENANT+ROOT scope create per-scope bindings."""
         role = self.given_v1_role("a role", default=["root:resource:verb", "tenant:resource:verb"])
 
         group, _ = self.given_group(name="a group")
         self.given_roles_assigned_to_group(group, [role])
 
-        v2_role_id: str = BindingMapping.objects.get(role=role).mappings["role"]["id"]
+        # With mixed scopes, we now get two bindings: one at tenant, one at root workspace.
+        mappings = BindingMapping.objects.filter(role=role)
+        self.assertEqual(mappings.count(), 2)
+
+        tenant_bm = mappings.get(resource_type_name="tenant")
+        ws_bm = mappings.get(resource_type_name="workspace")
         group_id = str(group.uuid)
 
-        self.expect_binding_absent(
-            self.default_workspace_resource(),
-            v2_role_id=v2_role_id,
-            group_id=group_id,
-        )
+        tenant_v2_role_id = tenant_bm.mappings["role"]["id"]
+        ws_v2_role_id = ws_bm.mappings["role"]["id"]
 
-        self.expect_binding_absent(
-            self.root_workspace_resource(),
-            v2_role_id=v2_role_id,
+        self.expect_binding_present(
+            self.tenant_resource(),
+            v2_role_id=tenant_v2_role_id,
             group_id=group_id,
         )
 
         self.expect_binding_present(
-            self.tenant_resource(),
-            v2_role_id=v2_role_id,
+            self.root_workspace_resource(),
+            v2_role_id=ws_v2_role_id,
+            group_id=group_id,
+        )
+
+        self.expect_binding_absent(
+            self.default_workspace_resource(),
+            v2_role_id=tenant_v2_role_id,
             group_id=group_id,
         )
 
@@ -1225,6 +1251,31 @@ class DualWriteGroupTestCase(DualWriteTestCase):
         # It is not meaningful to simply assign a role to a group in a V2 tenant.
         with self.assertRaises(RuntimeError):
             self.given_roles_unassigned_from_group(group, [role])
+
+    def test_empty_group_replicate_skipped(self):
+        """Group replication with no relations to add or remove is skipped at handler level."""
+        group, _ = self.given_group("empty group", [])
+
+        replicator = InMemoryRelationReplicator(self.tuples)
+        handler = RelationApiDualWriteGroupHandler(
+            group,
+            ReplicationEventType.ASSIGN_ROLE,
+            replicator=replicator,
+        )
+
+        # Don't generate any relations — simulate a no-op role assignment
+        with enable_logging():
+            with (
+                self.assertLogs("management.group.relation_api_dual_write_group_handler", level="INFO") as logs,
+                patch.object(replicator, "replicate", wraps=replicator.replicate) as spy,
+            ):
+                handler.replicate()
+
+            self.assertTrue(
+                any("Skipping empty replication event for group" in log for log in logs.output),
+                f"Expected handler-level skip log, got: {logs.output}",
+            )
+            spy.assert_not_called()
 
 
 class DualWriteSystemRolesTestCase(DualWriteTestCase):
@@ -2144,6 +2195,26 @@ class DualWriteSystemRolesTestCase(DualWriteTestCase):
             )
             self.assertEqual(len(deleted_tuple), 0)
 
+    def test_empty_system_role_replication_skipped(self):
+        """System role with no permissions skips replication at handler level."""
+        role = self.fixture.new_system_role(name="empty system role", permissions=[])
+
+        replicator = InMemoryRelationReplicator(self.tuples)
+        handler = SeedingRelationApiDualWriteHandler(role=role, replicator=replicator)
+
+        with enable_logging():
+            with (
+                self.assertLogs("management.role.relation_api_dual_write_handler", level="WARNING") as logs,
+                patch.object(replicator, "replicate", wraps=replicator.replicate) as spy,
+            ):
+                handler.replicate_new_system_role()
+
+            self.assertTrue(
+                any("Skipping empty replication event for system role" in log for log in logs.output),
+                f"Expected handler-level skip log, got: {logs.output}",
+            )
+            spy.assert_not_called()
+
 
 class DualWriteCustomRolesTestCase(DualWriteTestCase):
     """Test dual write logic when we are working with custom roles."""
@@ -2551,14 +2622,23 @@ class DualWriteCustomRolesTestCase(DualWriteTestCase):
         self.expect_binding_absent(tenant, v2_role_id=v2_role_id, group_id=group_id)
         self._expect_v2_consistent()
 
-        # Adding a new permission in tenant scope should bind the role to the tenant.
+        # Adding a new permission in tenant scope should split the role: tenant + root bindings.
         with self.settings(ROOT_SCOPE_PERMISSIONS="app:*:*", TENANT_SCOPE_PERMISSIONS="other_app:*:*"):
             self.given_update_to_v1_role(role, default=["app:resource:verb", "other_app:resource:verb"])
-            v2_role_id = get_v2_role_id()
 
-        self.expect_binding_absent(default_workspace, v2_role_id=v2_role_id, group_id=group_id)
-        self.expect_binding_absent(root_workspace, v2_role_id=v2_role_id, group_id=group_id)
-        self.expect_binding_present(tenant, v2_role_id=v2_role_id, group_id=group_id)
+        # With the split, we now have two V2 roles (one per scope group).
+        mappings = BindingMapping.objects.filter(role=role)
+        tenant_bm = mappings.filter(resource_type_name="tenant")
+        ws_bm = mappings.filter(resource_type_name="workspace")
+        self.assertEqual(tenant_bm.count(), 1, "Should have tenant binding for other_app")
+        self.assertEqual(ws_bm.count(), 1, "Should have workspace binding for app")
+
+        tenant_v2_role_id = tenant_bm.first().mappings["role"]["id"]
+        ws_v2_role_id = ws_bm.first().mappings["role"]["id"]
+
+        self.expect_binding_present(tenant, v2_role_id=tenant_v2_role_id, group_id=group_id)
+        self.expect_binding_present(root_workspace, v2_role_id=ws_v2_role_id, group_id=group_id)
+        self.expect_binding_absent(default_workspace, v2_role_id=tenant_v2_role_id, group_id=group_id)
         self._expect_v2_consistent()
 
     def test_role_with_mixed_resource_definitions_creates_multiple_bindings(self):
@@ -2648,6 +2728,190 @@ class DualWriteCustomRolesTestCase(DualWriteTestCase):
         # There should be no binding in the other tenant's workspace because it should be ignored.
         self.assertFalse(BindingMapping.objects.filter(role=role).exists())
         self.assertFalse(RoleBinding.objects.filter(role__v1_source=role).exists())
+
+    def test_empty_replication_event_skipped_for_custom_role(self):
+        """Empty replication events are caught at handler level, not at outbox."""
+        replicator = InMemoryRelationReplicator(self.tuples)
+
+        # Create a custom role with no access permissions — results in empty relations
+        role = Role.objects.create(name="empty role", system=False, tenant=self.tenant)
+
+        dual_write = self.dual_write_handler(role, ReplicationEventType.CREATE_CUSTOM_ROLE, replicator=replicator)
+
+        with enable_logging():
+            with (
+                self.assertLogs("management.role.relation_api_dual_write_handler", level="INFO") as logs,
+                patch.object(replicator, "replicate", wraps=replicator.replicate) as spy,
+            ):
+                dual_write.replicate_new_or_updated_role(role)
+
+            # Should log info about skipping, not reach the outbox with a warning
+            self.assertTrue(
+                any("Skipping empty replication event for role" in log for log in logs.output),
+                f"Expected handler-level skip log, got: {logs.output}",
+            )
+            spy.assert_not_called()
+
+    def test_empty_delete_replication_event_skipped_for_custom_role(self):
+        """Delete of role with no bindings produces no empty event."""
+        replicator = InMemoryRelationReplicator(self.tuples)
+
+        # Create role with no access — no binding mappings will exist
+        role = Role.objects.create(name="empty role for delete", system=False, tenant=self.tenant)
+
+        dual_write = self.dual_write_handler(role, ReplicationEventType.DELETE_CUSTOM_ROLE, replicator=replicator)
+        dual_write.prepare_for_update()
+        role.delete()
+
+        with enable_logging():
+            with (
+                self.assertLogs("management.role.relation_api_dual_write_handler", level="INFO") as logs,
+                patch.object(replicator, "replicate", wraps=replicator.replicate) as spy,
+            ):
+                dual_write.replicate_deleted_role()
+
+            self.assertTrue(
+                any("Skipping empty replication event for role" in log for log in logs.output),
+                f"Expected handler-level skip log, got: {logs.output}",
+            )
+            spy.assert_not_called()
+
+    @override_settings(V2_MIGRATION_APP_EXCLUDE_LIST=["cost-management"])
+    def test_excluded_app_role_skipped_without_warning(self):
+        """Roles with only excluded-app permissions are skipped gracefully, not warned about."""
+        # Create a custom role with only cost-management permissions (no dual-write migration).
+        # cost-management:reports:read is seeded by default, so we can reference it directly.
+        role = self.fixture.new_custom_role(
+            name="cost mgmt test role",
+            tenant=self.tenant,
+            resource_access=self.fixture.workspace_access(["cost-management:reports:read"]),
+        )
+
+        # Verify no binding mappings exist (role was never migrated — excluded app)
+        self.assertFalse(BindingMapping.objects.filter(role=role).exists())
+        self.assertTrue(role.access.exists(), "Role should have access permissions")
+
+        group, _ = self.given_group("test group", ["u1"])
+
+        with enable_logging():
+            with self.assertLogs("management.group.relation_api_dual_write_subject_handler", level="INFO") as logs:
+                self.given_roles_assigned_to_group(group, roles=[role])
+
+            # Should log info-level skip, NOT the warning about inconsistent relations
+            self.assertTrue(
+                any("migration-excluded apps" in log for log in logs.output),
+                f"Expected excluded-app skip log, got: {logs.output}",
+            )
+            self.assertFalse(
+                any("relations are inconsistent" in log for log in logs.output),
+                "Should NOT warn about inconsistency for excluded-app roles",
+            )
+
+        # Binding mappings should still NOT exist (role was not migrated)
+        self.assertFalse(
+            BindingMapping.objects.filter(role=role).exists(),
+            "Excluded-app roles should not be auto-migrated",
+        )
+
+
+@override_settings(ROOT_SCOPE_PERMISSIONS="advisor:*:*", TENANT_SCOPE_PERMISSIONS="subscriptions:*:*")
+class DualWriteMixedScopeTestCase(DualWriteTestCase):
+    """Test that mixed TENANT + workspace scope roles create per-scope bindings."""
+
+    def tearDown(self):
+        with self.subTest(msg="V2 consistency"):
+            assert_v1_v2_tuples_fully_consistent(test=self, tuples=self.tuples)
+        super().tearDown()
+
+    def test_custom_role_mixed_tenant_default_creates_two_bindings(self):
+        """A custom role with TENANT + DEFAULT perms creates bindings at both levels."""
+        role = self.given_v1_role(
+            "mixed_td",
+            default=["subscriptions:organization:read", "inventory:hosts:read"],
+        )
+
+        mappings = BindingMapping.objects.filter(role=role)
+        self.assertEqual(mappings.count(), 2, "Should have 2 BindingMapping records (tenant + workspace)")
+
+        tenant_bm = mappings.filter(resource_type_name="tenant")
+        ws_bm = mappings.filter(resource_type_name="workspace")
+        self.assertEqual(tenant_bm.count(), 1)
+        self.assertEqual(ws_bm.count(), 1)
+
+        # Tenant binding should have the subscriptions permission
+        tenant_binding = tenant_bm.first().get_role_binding()
+        self.assertIn("subscriptions_organization_read", tenant_binding.role.permissions)
+
+        # Workspace binding should have the inventory permission
+        ws_binding = ws_bm.first().get_role_binding()
+        self.assertIn("inventory_hosts_read", ws_binding.role.permissions)
+
+    def test_custom_role_mixed_tenant_root_default_splits_to_tenant_and_root(self):
+        """TENANT + ROOT + DEFAULT: TENANT perms at tenant, rest at root workspace."""
+        role = self.given_v1_role(
+            "mixed_trd",
+            default=["subscriptions:organization:read", "advisor:recommendation:read", "inventory:hosts:read"],
+        )
+
+        mappings = BindingMapping.objects.filter(role=role)
+        self.assertEqual(mappings.count(), 2, "Should have 2 BindingMapping records (tenant + root ws)")
+
+        tenant_bm = mappings.filter(resource_type_name="tenant")
+        ws_bm = mappings.filter(resource_type_name="workspace")
+        self.assertEqual(tenant_bm.count(), 1)
+        self.assertEqual(ws_bm.count(), 1)
+
+        # Workspace binding should be at root workspace (ROOT > DEFAULT)
+        ws_mapping = ws_bm.first()
+        root_ws = Workspace.objects.root(tenant=self.tenant)
+        self.assertEqual(ws_mapping.resource_id, str(root_ws.id))
+
+        # Verify permissions are split correctly
+        tenant_binding = tenant_bm.first().get_role_binding()
+        self.assertIn("subscriptions_organization_read", tenant_binding.role.permissions)
+
+        ws_binding = ws_mapping.get_role_binding()
+        self.assertIn("advisor_recommendation_read", ws_binding.role.permissions)
+        self.assertIn("inventory_hosts_read", ws_binding.role.permissions)
+
+    def test_custom_role_single_tenant_scope_no_split(self):
+        """A role with only TENANT-scoped permissions gets a single tenant binding."""
+        role = self.given_v1_role(
+            "tenant_only",
+            default=["subscriptions:organization:read", "subscriptions:products:write"],
+        )
+
+        mappings = BindingMapping.objects.filter(role=role)
+        self.assertEqual(mappings.count(), 1)
+        self.assertEqual(mappings.first().resource_type_name, "tenant")
+
+    def test_system_role_mixed_scope_creates_per_scope_bindings(self):
+        """A system role with mixed TENANT + workspace perms creates bindings at each scope when assigned to a group."""
+        seed_group()
+        role = self.given_v1_system_role(
+            "mixed_system",
+            permissions=["subscriptions:organization:read", "inventory:hosts:read"],
+            platform_default=True,
+        )
+
+        group, _ = self.given_group("test_group")
+        self.given_roles_assigned_to_group(group, [role])
+
+        # Should have bindings at both tenant and workspace scopes
+        group_uuid = str(group.uuid)
+        mappings = BindingMapping.objects.filter(role=role)
+
+        tenant_mappings = [m for m in mappings if m.resource_type_name == "tenant"]
+        ws_mappings = [m for m in mappings if m.resource_type_name == "workspace"]
+
+        self.assertGreaterEqual(len(tenant_mappings), 1, "Should have tenant-scope binding")
+        self.assertGreaterEqual(len(ws_mappings), 1, "Should have workspace-scope binding")
+
+        # Verify group is assigned in both
+        for m in tenant_mappings:
+            self.assertIn(group_uuid, m.mappings.get("groups", []))
+        for m in ws_mappings:
+            self.assertIn(group_uuid, m.mappings.get("groups", []))
 
 
 @override_settings(ATOMIC_RETRY_DISABLED=True)
@@ -2788,17 +3052,38 @@ class DualWriteCrossAccountReqeustTestCase(DualWriteTestCase):
         ensure_v2_write_activated(self.tenant)
         self._do_test_scope_assignment()
 
+    @override_settings(ROOT_SCOPE_PERMISSIONS="inventory:*:*", TENANT_SCOPE_PERMISSIONS="rbac:*:*")
+    def _do_test_binding_multiple_scopes(self):
+        system_role = self.given_v1_system_role("test", permissions=["rbac:resource:verb", "inventory:resource:verb"])
+        car = self.given_car(self.user_id, [system_role])
+
+        self._expect_user_root_count(1, system_role)
+        self._expect_user_tenant_count(1, system_role)
+
+    def test_binding_multiple_scopes(self):
+        self._do_test_binding_multiple_scopes()
+
+    def test_v2_binding_multiple_scopes(self):
+        ensure_v2_write_activated(self.tenant)
+        self._do_test_binding_multiple_scopes()
+
     def _do_test_scope_removal(self):
         system_role = self.given_v1_system_role("test", permissions=["app:resource:verb"])
 
         with self.settings(ROOT_SCOPE_PERMISSIONS="", TENANT_SCOPE_PERMISSIONS="app:resource:verb"):
             car = self.given_car(self.user_id, [system_role])
+
             self._expect_user_tenant_count(1, system_role)
+            self._expect_user_root_count(0, system_role)
+            self._expect_user_default_count(0, system_role)
 
         # Expiring the CAR should remove the role binding even if the role's scope has changed in the interim.
         with self.settings(ROOT_SCOPE_PERMISSIONS="", TENANT_SCOPE_PERMISSIONS=""):
             self.given_car_expired(car)
+
+            self._expect_user_tenant_count(0, system_role)
             self._expect_user_root_count(0, system_role)
+            self._expect_user_default_count(0, system_role)
 
     def test_scope_removal(self):
         self._do_test_scope_removal()
@@ -3130,7 +3415,7 @@ class RbacFixture:
         return CrossAccountRequest.objects.create(
             target_org=tenant.org_id,
             user_id=user_id,
-            start_date=datetime.now(),
-            end_date=datetime.now() + timedelta(days=1),
+            start_date=timezone.now(),
+            end_date=timezone.now() + timedelta(days=1),
             status="approved",
         )
