@@ -4,6 +4,7 @@ from unittest.mock import DEFAULT, Mock, patch
 from django.test import TestCase, override_settings
 from core.kafka import RBACProducer, get_cluster_config
 from kafka.errors import KafkaError, KafkaTimeoutError
+from tests.identity_request import IdentityRequest
 
 IT_MANAGED_CLUSTER = {
     "servers": ["it-broker:9096"],
@@ -98,7 +99,7 @@ class KafkaTests(TestCase):
 
 
 @override_settings(KAFKA_CLUSTERS={"it_managed": IT_MANAGED_CLUSTER})
-class GetClusterConfigTests(TestCase):
+class GetClusterConfigTests(IdentityRequest):
     """Tests for the named cluster-profile helper."""
 
     def test_returns_servers_and_auth_for_known_profile(self):
@@ -136,7 +137,7 @@ class GetClusterConfigTests(TestCase):
         self.assertNotIn("injected", auth2)
 
 
-class RBACProducerClusterSelectionTests(TestCase):
+class RBACProducerClusterSelectionTests(IdentityRequest):
     """RBACProducer selects the correct cluster by profile without affecting the default path."""
 
     @override_settings(
