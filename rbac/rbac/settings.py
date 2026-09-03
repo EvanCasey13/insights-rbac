@@ -608,14 +608,7 @@ if KAFKA_ENABLED:
     if clowder_principal_cleanup_dlq_topic:
         KAFKA_PRINCIPAL_CLEANUP_DLQ_TOPIC = clowder_principal_cleanup_dlq_topic.name
 
-# IT-Managed Kafka cluster (AWS MSK).
-#
-# A company-wide UMB -> Kafka shift is moving certain topics (starting with the principal-cleanup
-# canonical.user topics) onto a separate, IT-managed cluster that is NOT provisioned through Clowder.
-# Its credentials are delivered as flat keys on the rbac-secret Secret and surfaced as the env vars
-# below. This config is intentionally independent from the Clowder KAFKA_AUTH/KAFKA_SERVERS above and
-# is empty by default, so any consumer/producer that selects it safely no-ops until the secret lands
-# (and never falls back to the Clowder cluster).
+
 IT_KAFKA_BOOTSTRAP_SERVERS = ENVIRONMENT.get_value("IT_KAFKA_BOOTSTRAP_SERVERS", default="")
 IT_KAFKA_USERNAME = ENVIRONMENT.get_value("IT_KAFKA_USERNAME", default="")
 IT_KAFKA_PASSWORD = ENVIRONMENT.get_value("IT_KAFKA_PASSWORD", default="")

@@ -102,22 +102,26 @@ class GetClusterConfigTests(TestCase):
     """Tests for the named cluster-profile helper."""
 
     def test_returns_servers_and_auth_for_known_profile(self):
+        """A known profile returns its configured servers and auth."""
         servers, auth = get_cluster_config("it_managed")
         self.assertEqual(servers, ["it-broker:9096"])
         self.assertEqual(auth["sasl_plain_username"], "it-user")
         self.assertEqual(auth["security_protocol"], "SASL_SSL")
 
     def test_strips_producer_only_configs_for_consumer(self):
+        """for_consumer=True strips producer-only configs but keeps other auth."""
         _, auth = get_cluster_config("it_managed", for_consumer=True)
         self.assertNotIn("retries", auth)
         # Non-producer-only auth is preserved.
         self.assertEqual(auth["sasl_mechanism"], "SCRAM-SHA-512")
 
     def test_producer_keeps_producer_only_configs(self):
+        """Without for_consumer, producer-only configs are retained."""
         _, auth = get_cluster_config("it_managed")
         self.assertIn("retries", auth)
 
     def test_unknown_profile_returns_empty(self):
+        """An unknown profile returns empty servers/auth so callers no-op."""
         servers, auth = get_cluster_config("does-not-exist")
         self.assertEqual(servers, [])
         self.assertEqual(auth, {})
