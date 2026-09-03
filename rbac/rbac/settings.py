@@ -626,13 +626,7 @@ if IT_KAFKA_SERVERS and IT_KAFKA_USERNAME and IT_KAFKA_PASSWORD:
         "security_protocol": IT_KAFKA_SECURITY_PROTOCOL.upper(),
         "retries": 5,  # producer-only; PRODUCER_ONLY_CONFIGS strips it for consumers
     }
-    # No ssl_cafile: the IT-managed MSK cluster uses a public/system CA. If stage logs ever show a
-    # TLS/cert-verification failure, add IT_KAFKA_CA handling here.
-
-# Named Kafka cluster profiles. New IT-managed paths select a cluster by name via
-# core.kafka.get_cluster_config(). The existing Clowder paths are intentionally NOT migrated in this
-# change: they keep reading KAFKA_AUTH/KAFKA_SERVERS directly and never route through this registry.
-# A "clowder" profile will be added by the follow-up MR that actually migrates those call sites.
+   
 KAFKA_CLUSTERS = {
     "it_managed": {"servers": IT_KAFKA_SERVERS, "auth": IT_KAFKA_AUTH},
 }

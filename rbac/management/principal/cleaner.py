@@ -674,9 +674,7 @@ def process_principal_events_from_kafka(
     # must use distinct consumer groups to avoid message loss and offset conflicts
     env_name = getattr(settings, "ENV_NAME", "stage")
 
-    # The principal-cleanup topics live on the IT-managed Kafka cluster (not the Clowder cluster that
-    # backs the rest of RBAC's Kafka usage). Resolve that cluster's connection settings by profile;
-    # get_cluster_config already strips producer-only configs for the consumer.
+   
     it_kafka_servers, consumer_auth = get_cluster_config("it_managed", for_consumer=True)
     if not it_kafka_servers or not consumer_auth:
         # No IT-managed credentials wired yet (or missing) -> safely no-op instead of falling back to

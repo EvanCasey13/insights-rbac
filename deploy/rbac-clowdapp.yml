@@ -276,10 +276,6 @@ objects:
             value: ${KAFKA_PRINCIPAL_CLEANUP_TOPIC}
           - name: KAFKA_PRINCIPAL_CLEANUP_DLQ_TOPIC
             value: ${KAFKA_PRINCIPAL_CLEANUP_DLQ_TOPIC}
-          # IT-managed Kafka cluster (AWS MSK) that hosts the principal-cleanup topics.
-          # Delivered as flat keys on the rbac-secret Secret (same vault-secret -> secretKeyRef
-          # pattern as django-secret-key / principal-proxy-*). optional: true so pods still start
-          # before the secret is populated (settings.py also defaults these empty and no-ops).
           - name: IT_KAFKA_BOOTSTRAP_SERVERS
             valueFrom:
               secretKeyRef:
