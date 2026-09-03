@@ -608,6 +608,29 @@ if KAFKA_ENABLED:
     if clowder_principal_cleanup_dlq_topic:
         KAFKA_PRINCIPAL_CLEANUP_DLQ_TOPIC = clowder_principal_cleanup_dlq_topic.name
 
+
+IT_KAFKA_BOOTSTRAP_SERVERS = ENVIRONMENT.get_value("IT_KAFKA_BOOTSTRAP_SERVERS", default="")
+IT_KAFKA_USERNAME = ENVIRONMENT.get_value("IT_KAFKA_USERNAME", default="")
+IT_KAFKA_PASSWORD = ENVIRONMENT.get_value("IT_KAFKA_PASSWORD", default="")
+IT_KAFKA_SASL_MECHANISM = ENVIRONMENT.get_value("IT_KAFKA_SASL_MECHANISM", default="SCRAM-SHA-512")
+IT_KAFKA_SECURITY_PROTOCOL = ENVIRONMENT.get_value("IT_KAFKA_SECURITY_PROTOCOL", default="SASL_SSL")
+
+IT_KAFKA_SERVERS = [server.strip() for server in IT_KAFKA_BOOTSTRAP_SERVERS.split(",") if server.strip()]
+IT_KAFKA_AUTH = {}
+if IT_KAFKA_SERVERS and IT_KAFKA_USERNAME and IT_KAFKA_PASSWORD:
+    IT_KAFKA_AUTH = {
+        "bootstrap_servers": IT_KAFKA_SERVERS,
+        "sasl_plain_username": IT_KAFKA_USERNAME,
+        "sasl_plain_password": IT_KAFKA_PASSWORD,
+        "sasl_mechanism": IT_KAFKA_SASL_MECHANISM.upper(),
+        "security_protocol": IT_KAFKA_SECURITY_PROTOCOL.upper(),
+        "retries": 5,  # producer-only; PRODUCER_ONLY_CONFIGS strips it for consumers
+    }
+
+KAFKA_CLUSTERS = {
+    "it_managed": {"servers": IT_KAFKA_SERVERS, "auth": IT_KAFKA_AUTH},
+}
+
 # BOP TLS settings
 if ENVIRONMENT.bool("CLOWDER_ENABLED", default=False) and ENVIRONMENT.bool("USE_CLOWDER_CA_FOR_BOP", default=False):
     BOP_CLIENT_CERT_PATH = LoadedConfig.tlsCAPath

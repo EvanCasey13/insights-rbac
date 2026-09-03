@@ -26,7 +26,7 @@ from typing import NamedTuple, Optional
 from xml.parsers.expat import ExpatError
 
 import xmltodict
-from core.kafka import PRODUCER_ONLY_CONFIGS, RBACProducer
+from core.kafka import RBACProducer, get_cluster_config
 from django.conf import settings
 from django.db import connection, transaction
 from kafka import KafkaConsumer
@@ -673,38 +673,38 @@ def process_principal_events_from_kafka(
     # In multi-env setups (staging, ephemeral, CI) that share a Kafka cluster, environments
     # must use distinct consumer groups to avoid message loss and offset conflicts
     env_name = getattr(settings, "ENV_NAME", "stage")
+
+    it_kafka_servers, consumer_auth = get_cluster_config("it_managed", for_consumer=True)
+    if not it_kafka_servers or not consumer_auth:
+        # No IT-managed credentials wired yet (or missing) -> safely no-op instead of falling back to
+        # the Clowder cluster, which does not host the principal-cleanup topics.
+        logger.warning(
+            "process_principal_events_from_kafka: IT-managed Kafka cluster is not configured "
+            "(missing bootstrap servers or credentials). Skipping Kafka consume for topic '%s'.",
+            topic,
+        )
+        return
+
     kafka_config = {
-        "bootstrap_servers": settings.KAFKA_SERVERS,
+        "bootstrap_servers": it_kafka_servers,
         "group_id": f"{settings.SA_NAME}-{env_name}-principal-cleanup",
         "auto_offset_reset": "earliest",
         "enable_auto_commit": False,  # Manual commit for at-least-once semantics
         # No value_deserializer - leave as bytes to handle tombstones and UTF-8 errors in process_kafka_message
         "consumer_timeout_ms": 15000,  # 15 second timeout per run, matches UMB behavior
     }
-
-    # Add authentication if configured
-    kafka_auth = getattr(settings, "KAFKA_AUTH", None)
-    if kafka_auth:
-        # settings.KAFKA_AUTH is shared with the DLQ producer and includes producer-only
-        # options (e.g. "retries") that KafkaConsumer rejects; filter them out here.
-        consumer_auth = {k: v for k, v in kafka_auth.items() if k not in PRODUCER_ONLY_CONFIGS}
-        filtered_configs = set(kafka_auth.keys()) & PRODUCER_ONLY_CONFIGS
-        if filtered_configs:
-            logger.info(
-                "process_principal_events_from_kafka: Filtered producer-only configs for consumer: %s",
-                filtered_configs,
-            )
-        kafka_config.update(consumer_auth)
+    kafka_config.update(consumer_auth)
 
     # Initialize consumer to None to avoid UnboundLocalError in finally block
     consumer = None
 
-    # Initialize DLQ producer if DLQ topic is configured
+    # Initialize DLQ producer if DLQ topic is configured. The DLQ topic is also on the IT-managed
+    # cluster, so the producer must target that profile (not the default Clowder one).
     dlq_topic = getattr(settings, "KAFKA_PRINCIPAL_CLEANUP_DLQ_TOPIC", None)
     dlq_producer = None
     if dlq_topic:
         try:
-            dlq_producer = RBACProducer()
+            dlq_producer = RBACProducer(cluster="it_managed")
             logger.info("process_principal_events_from_kafka: DLQ producer initialized for topic: %s", dlq_topic)
         except Exception as e:
             logger.warning(
