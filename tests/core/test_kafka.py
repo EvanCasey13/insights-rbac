@@ -1,9 +1,21 @@
 from copy import deepcopy
 from unittest.mock import DEFAULT, Mock, patch
 
-from django.test import TestCase
-from core.kafka import RBACProducer
+from django.test import TestCase, override_settings
+from core.kafka import RBACProducer, get_cluster_config
 from kafka.errors import KafkaError, KafkaTimeoutError
+
+IT_MANAGED_CLUSTER = {
+    "servers": ["it-broker:9096"],
+    "auth": {
+        "bootstrap_servers": ["it-broker:9096"],
+        "sasl_plain_username": "it-user",
+        "sasl_plain_password": "it-pass",
+        "sasl_mechanism": "SCRAM-SHA-512",
+        "security_protocol": "SASL_SSL",
+        "retries": 5,  # producer-only
+    },
+}
 
 
 def copy_call_args(mock):
@@ -83,6 +95,76 @@ class KafkaTests(TestCase):
             MockKafkaProducer.get_producer.side_effect = mock_logger.info("Kafka producer initialized successfully")
 
         mock_logger.info.assert_any_call("Kafka producer initialized successfully")
+
+
+@override_settings(KAFKA_CLUSTERS={"it_managed": IT_MANAGED_CLUSTER})
+class GetClusterConfigTests(TestCase):
+    """Tests for the named cluster-profile helper."""
+
+    def test_returns_servers_and_auth_for_known_profile(self):
+        servers, auth = get_cluster_config("it_managed")
+        self.assertEqual(servers, ["it-broker:9096"])
+        self.assertEqual(auth["sasl_plain_username"], "it-user")
+        self.assertEqual(auth["security_protocol"], "SASL_SSL")
+
+    def test_strips_producer_only_configs_for_consumer(self):
+        _, auth = get_cluster_config("it_managed", for_consumer=True)
+        self.assertNotIn("retries", auth)
+        # Non-producer-only auth is preserved.
+        self.assertEqual(auth["sasl_mechanism"], "SCRAM-SHA-512")
+
+    def test_producer_keeps_producer_only_configs(self):
+        _, auth = get_cluster_config("it_managed")
+        self.assertIn("retries", auth)
+
+    def test_unknown_profile_returns_empty(self):
+        servers, auth = get_cluster_config("does-not-exist")
+        self.assertEqual(servers, [])
+        self.assertEqual(auth, {})
+
+    def test_returns_copies_not_references(self):
+        """Mutating the returned values must not corrupt the registry."""
+        servers, auth = get_cluster_config("it_managed")
+        servers.append("mutated")
+        auth["injected"] = True
+        servers2, auth2 = get_cluster_config("it_managed")
+        self.assertNotIn("mutated", servers2)
+        self.assertNotIn("injected", auth2)
+
+
+class RBACProducerClusterSelectionTests(TestCase):
+    """RBACProducer selects the correct cluster by profile without affecting the default path."""
+
+    @override_settings(
+        DEVELOPMENT=False,
+        MOCK_KAFKA=False,
+        KAFKA_ENABLED=True,
+        KAFKA_AUTH={"bootstrap_servers": ["clowder:9092"], "sasl_plain_username": "clowder-user"},
+        KAFKA_SERVERS=["clowder:9092"],
+        KAFKA_CLUSTERS={"it_managed": IT_MANAGED_CLUSTER},
+    )
+    @patch("core.kafka.KafkaProducer")
+    def test_default_producer_uses_clowder_settings(self, mock_producer):
+        """Default RBACProducer() reads settings.KAFKA_AUTH directly (Clowder path unchanged)."""
+        RBACProducer().get_producer()
+        _, kwargs = mock_producer.call_args
+        self.assertEqual(kwargs["sasl_plain_username"], "clowder-user")
+
+    @override_settings(
+        DEVELOPMENT=False,
+        MOCK_KAFKA=False,
+        KAFKA_ENABLED=True,
+        KAFKA_AUTH={"bootstrap_servers": ["clowder:9092"], "sasl_plain_username": "clowder-user"},
+        KAFKA_SERVERS=["clowder:9092"],
+        KAFKA_CLUSTERS={"it_managed": IT_MANAGED_CLUSTER},
+    )
+    @patch("core.kafka.KafkaProducer")
+    def test_it_managed_producer_uses_profile(self, mock_producer):
+        """RBACProducer(cluster="it_managed") builds from the it_managed profile, not Clowder."""
+        RBACProducer(cluster="it_managed").get_producer()
+        _, kwargs = mock_producer.call_args
+        self.assertEqual(kwargs["sasl_plain_username"], "it-user")
+        self.assertEqual(kwargs["security_protocol"], "SASL_SSL")
 
 
 class SendKafkaMessageTests(TestCase):

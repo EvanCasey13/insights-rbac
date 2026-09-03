@@ -608,6 +608,42 @@ if KAFKA_ENABLED:
     if clowder_principal_cleanup_dlq_topic:
         KAFKA_PRINCIPAL_CLEANUP_DLQ_TOPIC = clowder_principal_cleanup_dlq_topic.name
 
+# IT-Managed Kafka cluster (AWS MSK).
+#
+# A company-wide UMB -> Kafka shift is moving certain topics (starting with the principal-cleanup
+# canonical.user topics) onto a separate, IT-managed cluster that is NOT provisioned through Clowder.
+# Its credentials are delivered as flat keys on the rbac-secret Secret and surfaced as the env vars
+# below. This config is intentionally independent from the Clowder KAFKA_AUTH/KAFKA_SERVERS above and
+# is empty by default, so any consumer/producer that selects it safely no-ops until the secret lands
+# (and never falls back to the Clowder cluster).
+IT_KAFKA_BOOTSTRAP_SERVERS = ENVIRONMENT.get_value("IT_KAFKA_BOOTSTRAP_SERVERS", default="")
+IT_KAFKA_USERNAME = ENVIRONMENT.get_value("IT_KAFKA_USERNAME", default="")
+IT_KAFKA_PASSWORD = ENVIRONMENT.get_value("IT_KAFKA_PASSWORD", default="")
+IT_KAFKA_SASL_MECHANISM = ENVIRONMENT.get_value("IT_KAFKA_SASL_MECHANISM", default="SCRAM-SHA-512")
+IT_KAFKA_SECURITY_PROTOCOL = ENVIRONMENT.get_value("IT_KAFKA_SECURITY_PROTOCOL", default="SASL_SSL")
+
+IT_KAFKA_SERVERS = [server.strip() for server in IT_KAFKA_BOOTSTRAP_SERVERS.split(",") if server.strip()]
+IT_KAFKA_AUTH = {}
+if IT_KAFKA_SERVERS and IT_KAFKA_USERNAME and IT_KAFKA_PASSWORD:
+    IT_KAFKA_AUTH = {
+        "bootstrap_servers": IT_KAFKA_SERVERS,
+        "sasl_plain_username": IT_KAFKA_USERNAME,
+        "sasl_plain_password": IT_KAFKA_PASSWORD,
+        "sasl_mechanism": IT_KAFKA_SASL_MECHANISM.upper(),
+        "security_protocol": IT_KAFKA_SECURITY_PROTOCOL.upper(),
+        "retries": 5,  # producer-only; PRODUCER_ONLY_CONFIGS strips it for consumers
+    }
+    # No ssl_cafile: the IT-managed MSK cluster uses a public/system CA. If stage logs ever show a
+    # TLS/cert-verification failure, add IT_KAFKA_CA handling here.
+
+# Named Kafka cluster profiles. New IT-managed paths select a cluster by name via
+# core.kafka.get_cluster_config(). The existing Clowder paths are intentionally NOT migrated in this
+# change: they keep reading KAFKA_AUTH/KAFKA_SERVERS directly and never route through this registry.
+# A "clowder" profile will be added by the follow-up MR that actually migrates those call sites.
+KAFKA_CLUSTERS = {
+    "it_managed": {"servers": IT_KAFKA_SERVERS, "auth": IT_KAFKA_AUTH},
+}
+
 # BOP TLS settings
 if ENVIRONMENT.bool("CLOWDER_ENABLED", default=False) and ENVIRONMENT.bool("USE_CLOWDER_CA_FOR_BOP", default=False):
     BOP_CLIENT_CERT_PATH = LoadedConfig.tlsCAPath
