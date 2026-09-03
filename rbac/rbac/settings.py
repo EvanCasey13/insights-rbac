@@ -626,7 +626,7 @@ if IT_KAFKA_SERVERS and IT_KAFKA_USERNAME and IT_KAFKA_PASSWORD:
         "security_protocol": IT_KAFKA_SECURITY_PROTOCOL.upper(),
         "retries": 5,  # producer-only; PRODUCER_ONLY_CONFIGS strips it for consumers
     }
-   
+
 KAFKA_CLUSTERS = {
     "it_managed": {"servers": IT_KAFKA_SERVERS, "auth": IT_KAFKA_AUTH},
 }
