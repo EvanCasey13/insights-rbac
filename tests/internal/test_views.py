@@ -5931,6 +5931,7 @@ class InternalOptInViewsetTests(BaseInternalViewsetTests):
 
         response = self._patch({"v2_opted_in": True})
         self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
+        self.assertFalse(is_v2_opted_in(self.tenant))
 
     def test_opt_out(self):
         set_v2_opt_in_state(self.tenant, True)
@@ -5951,10 +5952,12 @@ class InternalOptInViewsetTests(BaseInternalViewsetTests):
 
         self._assert_response(response, {"v2_opted_in": False})
         self.assertFalse(is_v2_opted_in(self.tenant))
+        self.assertFalse(is_v2_opted_in(self.tenant))
 
     def test_invalid_patch(self):
         response = self._patch({"something": "else"})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(is_v2_opted_in(self.tenant))
 
     def test_not_found(self):
         response = self.client.get(self._url_for("invalid_org"), **self.request.META)

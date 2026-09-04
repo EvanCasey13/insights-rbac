@@ -3448,9 +3448,15 @@ def update_tenant_v2_opt_in(request, org_id: str):
                 {"error": "expected body to be a JSON object: " + str(e)}, status=status.HTTP_400_BAD_REQUEST
             )
 
+        if not isinstance(body, dict):
+            return JsonResponse(
+                {"error": f"expected body to be a JSON object, but got: {body}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         if not {"v2_opted_in"}.issuperset(body.keys()):
             return JsonResponse(
-                {"error": f"expected body to contain only v2_opted_in, but found: " f"{list(body.keys())}"},
+                {"error": f"expected body to contain only v2_opted_in, but found: {list(body.keys())}"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
