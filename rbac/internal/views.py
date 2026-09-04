@@ -67,6 +67,7 @@ from kessel.relations.v1beta1 import (
     relation_tuples_pb2,
     relation_tuples_pb2_grpc,
 )
+from management.atomic_transactions import atomic_with_retry
 from management.audit_log.model import AuditLog
 from management.cache import JWTCache, TenantCache
 from management.group.relation_api_dual_write_group_handler import RelationApiDualWriteGroupHandler
@@ -117,7 +118,9 @@ from management.tasks import (
     run_seeds_in_worker,
     run_sync_schemas_in_worker,
 )
+from management.tenant_mapping.exceptions import TenantNotBootstrappedError
 from management.tenant_mapping.model import TenantMapping
+from management.tenant_mapping.v2_activation import InvalidV2OptOutError, is_v2_opted_in, set_v2_opt_in_state
 from management.tenant_service.v2 import V2TenantBootstrapService
 from management.utils import (
     create_client_channel,
@@ -3411,3 +3414,65 @@ def bootstrap_users_from_user_ids(request):
     )
 
     return JsonResponse({"dry_run": dry_run, "results": results}, status=200)
+
+
+@require_http_methods(["GET", "PATCH"])
+@atomic_with_retry(retries=3)
+def update_tenant_v2_opt_in(request, org_id: str):
+    """
+    Update a tenant's V2 opt-in status.
+
+    GET /_private/api/utils/tenant_v2_opt_in/<org_id>/
+    PATCH /_private/api/utils/tenant_v2_opt_in/<org_id>/
+
+    The GET method returns the tenant's current opt-in status. The PATCH method can be used to opt a tenant into or
+    out of V2. (Note that opting out is not possible with the public API, only with this API.)
+
+    PATCH expects a JSON body with a boolean field "v2_opted_in".
+    """
+    tenant = Tenant.objects.filter(org_id=org_id).first()
+
+    if tenant is None:
+        return JsonResponse({"error": f"Org ID {org_id!r} not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    def _get_response():
+        return JsonResponse({"v2_opted_in": is_v2_opted_in(tenant)})
+
+    if request.method == "GET":
+        return _get_response()
+    elif request.method == "PATCH":
+        try:
+            body = json.loads(request.body)
+        except Exception as e:
+            return JsonResponse(
+                {"error": "expected body to be a JSON object: " + str(e)}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not isinstance(body, dict):
+            return JsonResponse(
+                {"error": f"expected body to be a JSON object, but got: {body}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not {"v2_opted_in"}.issuperset(body.keys()):
+            return JsonResponse(
+                {"error": f"expected body to contain only v2_opted_in, but found: {list(body.keys())}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if "v2_opted_in" not in body:
+            return _get_response()
+
+        requested_state = body["v2_opted_in"]
+
+        if not isinstance(requested_state, bool):
+            return JsonResponse({"error": "expected v2_opted_in to be a bool"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            set_v2_opt_in_state(tenant, requested_state)
+        except (TenantNotBootstrappedError, InvalidV2OptOutError) as e:
+            return JsonResponse({"error": str(e)}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+        return JsonResponse({"v2_opted_in": requested_state})
+    else:
+        raise AssertionError(f"Unexpected method: {request.method}")

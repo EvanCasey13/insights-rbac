@@ -54,6 +54,7 @@ from management.role.relation_api_dual_write_handler import (
 )
 from management.role.user_source import SourceKey
 from management.tenant_mapping.model import TenantMapping
+from management.tenant_mapping.v2_activation import is_v2_opted_in, set_v2_opt_in_state, ensure_v2_write_activated
 from management.tenant_service.v1 import V1TenantBootstrapService
 from management.tenant_service.v2 import V2TenantBootstrapService
 from management.workspace.model import Workspace
@@ -5885,6 +5886,82 @@ class KesselParityCheckEndpointTests(BaseInternalViewsetTests):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("non-empty strings", response.content.decode())
+
+
+@override_settings(ATOMIC_RETRY_DISABLED=True)
+class InternalOptInViewsetTests(BaseInternalViewsetTests):
+    def setUp(self):
+        super().setUp()
+        bootstrap_tenant_for_v2_test(self.tenant)
+
+        self.url = self._url_for(self.tenant.org_id)
+
+    def _url_for(self, org_id: str):
+        return f"/_private/api/utils/tenant_v2_opt_in/{org_id}/"
+
+    def _get(self):
+        return self.client.get(self.url, **self.request.META)
+
+    def _patch(self, body):
+        return self.client.patch(self.url, body, content_type="application/json", **self.request.META)
+
+    def _assert_response(self, response, body, status: int = 200):
+        self.assertEqual(json.loads(response.content), body)
+        self.assertEqual(response.status_code, status)
+
+    def test_get(self):
+        self.assertFalse(is_v2_opted_in(self.tenant))
+
+        response = self._get()
+        self._assert_response(response, {"v2_opted_in": False})
+
+        set_v2_opt_in_state(self.tenant, True)
+
+        response = self._get()
+        self._assert_response(response, {"v2_opted_in": True})
+
+    def test_opt_in(self):
+        response = self._patch({"v2_opted_in": True})
+
+        self._assert_response(response, {"v2_opted_in": True})
+        self.assertTrue(is_v2_opted_in(self.tenant))
+
+    def test_invalid_opt_in(self):
+        TenantMapping.objects.filter(tenant=self.tenant).delete()
+
+        response = self._patch({"v2_opted_in": True})
+        self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
+        self.assertFalse(is_v2_opted_in(self.tenant))
+
+    def test_opt_out(self):
+        set_v2_opt_in_state(self.tenant, True)
+        response = self._patch({"v2_opted_in": False})
+
+        self._assert_response(response, {"v2_opted_in": False})
+        self.assertFalse(is_v2_opted_in(self.tenant))
+
+    def test_invalid_opt_out(self):
+        ensure_v2_write_activated(self.tenant)
+        response = self._patch({"v2_opted_in": False})
+
+        self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
+        self.assertTrue(is_v2_opted_in(self.tenant))
+
+    def test_empty_patch(self):
+        response = self._patch({})
+
+        self._assert_response(response, {"v2_opted_in": False})
+        self.assertFalse(is_v2_opted_in(self.tenant))
+        self.assertFalse(is_v2_opted_in(self.tenant))
+
+    def test_invalid_patch(self):
+        response = self._patch({"something": "else"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(is_v2_opted_in(self.tenant))
+
+    def test_not_found(self):
+        response = self.client.get(self._url_for("invalid_org"), **self.request.META)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
 
 @override_settings(KAFKA_ENABLED=True, RBAC_KAFKA_CONSUMER_TOPIC="test-topic")
