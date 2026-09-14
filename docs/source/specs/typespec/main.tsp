@@ -40,12 +40,22 @@ scalar UUID extends string;
 @example(#{
     application: "rbac",
     resource_type: "workspace",
-    operation: "read"
+    operation: "read",
+    permission: "rbac:workspace:read",
+    description: "Read access to workspaces",
+    requires: #[]
 })
 model Permission {
-    application: string;
-    resource_type: string;
-    operation: string;
+    application?: string;
+    resource_type?: string;
+    @doc("The action allowed by this permission (e.g. 'read', 'create', 'delete', 'update'). Equivalent to `verb` in the v1 API.")
+    operation?: string;
+    @doc("The full permission string, e.g. 'rbac:workspace:read'.")
+    permission?: string;
+    @doc("A description of what this permission grants access to.")
+    description?: string;
+    @doc("List of other permission strings that are required alongside this one.")
+    requires?: string[];
 }
 
 @example(#{
@@ -1813,7 +1823,10 @@ namespace Permissions {
             #{
                 application: "rbac",
                 resource_type: "workspace",
-                operation: "read"
+                operation: "read",
+                permission: "rbac:workspace:read",
+                description: "Read access to workspaces",
+                requires: #[]
             }
         ]
     })
@@ -1825,7 +1838,7 @@ namespace Permissions {
     }
 
     @doc("List the permissions for a tenant")
-    @summary("By default, responses are sorted in ascending order by permission application.")
+    @summary("By default, responses are sorted in ascending order by the full permission string, matching v1 behavior.")
     @opExample(#{
         parameters: #{
             limit: 10,
@@ -1847,7 +1860,10 @@ namespace Permissions {
                 #{
                     application: "rbac",
                     resource_type: "workspace",
-                    operation: "read"
+                    operation: "read",
+                    permission: "rbac:workspace:read",
+                    description: "Read access to workspaces",
+                    requires: #[]
                 }
             ]
         }
@@ -1864,13 +1880,53 @@ namespace Permissions {
         @doc("Filter permissions by the resource type (e.g. 'tenant', 'workspace'). When omitted, returns permissions from all types. You may also use a comma-separated list to match on multiple resource_types.")
         @query resource_type?: string;
 
-        @doc("Filter by operation (e.g. 'read', 'create', 'delete', 'update'). You may also use a comma-separated list to match on multiple operation types.")
+        @doc("Filter by operation (e.g. 'read', 'create', 'delete', 'update'). You may also use a comma-separated list to match on multiple operation types. Equivalent to `verb` in the v1 API.")
         @query operation?: string;
 
-        @doc("Control which fields are included in the response.")
-        @query fields?: FieldMask = "application,resource_type,operation";
+        @doc("Filter by full permission string(s). Comma-separated exact match (e.g. 'rbac:workspace:read' or 'rbac:workspace:read,inventory:hosts:write').")
+        @query permission?: string;
 
-        @doc("Sort by specified field(s), prefix with '-' for descending order. Allowed fields: application, resource_type, operation.")
-        @query order_by?: OrderBy = "application";
-    ): PermissionListResponse | Problems.CommonProblems | Problems.Problem400;
+        @doc("When true, exclude wildcard/global permissions (where application, resource_type, or operation is '*') from the results.")
+        @query exclude_globals?: boolean = false;
+
+        @doc("Exclude permissions already assigned to the given role(s). Comma-separated list of role UUIDs.")
+        @query exclude_roles?: string;
+
+        @doc("When true, only return permissions belonging to applications allowed for role creation.")
+        @query allowed_only?: boolean = false;
+
+        @doc("Control which fields are included in the response.")
+        @query fields?: FieldMask = "application,resource_type,operation,permission";
+
+        @doc("Sort by specified field(s), prefix with '-' for descending order. Allowed fields: application, resource_type, operation, permission.")
+        @query order_by?: OrderBy = "permission";
+    ): PermissionListResponse | Problems.CommonProblems;
+
+    model PermissionOptionsResponse {
+        ...Pagination;
+
+        @doc("List of distinct values for the requested field")
+        data: string[];
+    }
+
+    @doc("List distinct values for a single permission field, used to populate filter options (e.g. Application, Resource type, Operation) in the UI.")
+    @route("/options/")
+    @get op options(
+        @query limit?: Limit = DefaultLimit;
+
+        @doc("Offset for offset-based pagination.")
+        @query offset?: Offset = DefaultOffset;
+
+        @doc("The field to return distinct values for. One of: application, resource_type, operation, permission.")
+        @query field: "application" | "resource_type" | "operation" | "permission";
+
+        @doc("Filter by application name before computing distinct values. Comma-separated list supported.")
+        @query application?: string;
+
+        @doc("Filter by resource type before computing distinct values. Comma-separated list supported.")
+        @query resource_type?: string;
+
+        @doc("Filter by operation before computing distinct values. Comma-separated list supported.")
+        @query operation?: string;
+    ): PermissionOptionsResponse | Problems.CommonProblems;
 }
