@@ -260,8 +260,22 @@ objects:
                 key: rbac-client-secret
                 name: service-accounts
                 optional: true
+          - name: INVENTORY_API_CLIENT_ID
+            valueFrom:
+              secretKeyRef:
+                key: rbac-client-id
+                name: service-accounts
+                optional: true
+          - name: INVENTORY_API_CLIENT_SECRET
+            valueFrom:
+              secretKeyRef:
+                key: rbac-client-secret
+                name: service-accounts
+                optional: true
           - name: INVENTORY_API_SERVER
             value: ${INVENTORY_API_SERVER}
+          - name: INVENTORY_API_TOKEN_URL
+            value: ${INVENTORY_API_TOKEN_URL}
           - name: REDHAT_SSO
             value: ${REDHAT_SSO}
           - name: REPLICATION_TO_RELATION_ENABLED
@@ -276,6 +290,32 @@ objects:
             value: ${KAFKA_PRINCIPAL_CLEANUP_TOPIC}
           - name: KAFKA_PRINCIPAL_CLEANUP_DLQ_TOPIC
             value: ${KAFKA_PRINCIPAL_CLEANUP_DLQ_TOPIC}
+          - name: KAFKA_PRINCIPAL_CLEANUP_SESSION_TIMEOUT_MS
+            value: ${KAFKA_PRINCIPAL_CLEANUP_SESSION_TIMEOUT_MS}
+          - name: KAFKA_PRINCIPAL_CLEANUP_HEARTBEAT_INTERVAL_MS
+            value: ${KAFKA_PRINCIPAL_CLEANUP_HEARTBEAT_INTERVAL_MS}
+          - name: KAFKA_PRINCIPAL_CLEANUP_MAX_POLL_INTERVAL_MS
+            value: ${KAFKA_PRINCIPAL_CLEANUP_MAX_POLL_INTERVAL_MS}
+          - name: KAFKA_PRINCIPAL_CLEANUP_STATIC_MEMBERSHIP_ENABLED
+            value: ${KAFKA_PRINCIPAL_CLEANUP_STATIC_MEMBERSHIP_ENABLED}
+          - name: IT_KAFKA_BOOTSTRAP_SERVERS
+            valueFrom:
+              secretKeyRef:
+                key: kafka-it-bootstrap-servers
+                name: rbac-secret
+                optional: true
+          - name: IT_KAFKA_USERNAME
+            valueFrom:
+              secretKeyRef:
+                key: kafka-it-username
+                name: rbac-secret
+                optional: true
+          - name: IT_KAFKA_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                key: kafka-it-password
+                name: rbac-secret
+                optional: true
           - name: V2_MIGRATION_APP_EXCLUDE_LIST
             value: ${V2_MIGRATION_APP_EXCLUDE_LIST}
           - name: V2_STRICT_ACCESS_CHECK_FLAG_APPLICATION_NAMES
@@ -316,6 +356,8 @@ objects:
             value: ${TENANT_SCOPE_PERMISSIONS}
           - name: DEFAULT_SCOPE_PERMISSIONS
             value: ${DEFAULT_SCOPE_PERMISSIONS}
+          - name: ALL_SCOPE_PERMISSIONS
+            value: ${ALL_SCOPE_PERMISSIONS}
           - name: AUTOMATIC_SCOPE_MIGRATION_ENABLED
             value: ${AUTOMATIC_SCOPE_MIGRATION_ENABLED}
           ####### Following envs are for scheduler, doesn't hurt to put in worker
@@ -674,6 +716,8 @@ objects:
             value: ${TENANT_SCOPE_PERMISSIONS}
           - name: DEFAULT_SCOPE_PERMISSIONS
             value: ${DEFAULT_SCOPE_PERMISSIONS}
+          - name: ALL_SCOPE_PERMISSIONS
+            value: ${ALL_SCOPE_PERMISSIONS}
           - name: AUTOMATIC_SCOPE_MIGRATION_ENABLED
             value: ${AUTOMATIC_SCOPE_MIGRATION_ENABLED}
           - name: WORKSPACE_ACCESS_TIMING_ENABLED
@@ -796,6 +840,8 @@ objects:
             value: ${TENANT_SCOPE_PERMISSIONS}
           - name: DEFAULT_SCOPE_PERMISSIONS
             value: ${DEFAULT_SCOPE_PERMISSIONS}
+          - name: ALL_SCOPE_PERMISSIONS
+            value: ${ALL_SCOPE_PERMISSIONS}
           - name: AUTOMATIC_SCOPE_MIGRATION_ENABLED
             value: ${AUTOMATIC_SCOPE_MIGRATION_ENABLED}
           - name: PARITY_CHECK_ENABLED
@@ -875,6 +921,14 @@ objects:
             value: ${KAFKA_PRINCIPAL_CLEANUP_TOPIC}
           - name: KAFKA_PRINCIPAL_CLEANUP_DLQ_TOPIC
             value: ${KAFKA_PRINCIPAL_CLEANUP_DLQ_TOPIC}
+          - name: KAFKA_PRINCIPAL_CLEANUP_SESSION_TIMEOUT_MS
+            value: ${KAFKA_PRINCIPAL_CLEANUP_SESSION_TIMEOUT_MS}
+          - name: KAFKA_PRINCIPAL_CLEANUP_HEARTBEAT_INTERVAL_MS
+            value: ${KAFKA_PRINCIPAL_CLEANUP_HEARTBEAT_INTERVAL_MS}
+          - name: KAFKA_PRINCIPAL_CLEANUP_MAX_POLL_INTERVAL_MS
+            value: ${KAFKA_PRINCIPAL_CLEANUP_MAX_POLL_INTERVAL_MS}
+          - name: KAFKA_PRINCIPAL_CLEANUP_STATIC_MEMBERSHIP_ENABLED
+            value: ${KAFKA_PRINCIPAL_CLEANUP_STATIC_MEMBERSHIP_ENABLED}
           - name: REPLICATION_TO_RELATION_ENABLED
             value: ${REPLICATION_TO_RELATION_ENABLED}
           - name: EPH_ENV
@@ -894,6 +948,23 @@ objects:
                 key: rbac-client-secret
                 name: service-accounts
                 optional: true
+          # Inventory API variables
+          - name: INVENTORY_API_CLIENT_ID
+            valueFrom:
+              secretKeyRef:
+                key: rbac-client-id
+                name: service-accounts
+                optional: true
+          - name: INVENTORY_API_CLIENT_SECRET
+            valueFrom:
+              secretKeyRef:
+                key: rbac-client-secret
+                name: service-accounts
+                optional: true
+          - name: INVENTORY_API_SERVER
+            value: ${INVENTORY_API_SERVER}
+          - name: INVENTORY_API_TOKEN_URL
+            value: ${INVENTORY_API_TOKEN_URL}
           - name: SYSTEM_DEFAULT_ROOT_WORKSPACE_ROLE_UUID
             value: ${SYSTEM_DEFAULT_ROOT_WORKSPACE_ROLE_UUID}
           - name: SYSTEM_ADMIN_ROOT_WORKSPACE_ROLE_UUID
@@ -908,6 +979,8 @@ objects:
             value: ${TENANT_SCOPE_PERMISSIONS}
           - name: DEFAULT_SCOPE_PERMISSIONS
             value: ${DEFAULT_SCOPE_PERMISSIONS}
+          - name: ALL_SCOPE_PERMISSIONS
+            value: ${ALL_SCOPE_PERMISSIONS}
           - name: AUTOMATIC_SCOPE_MIGRATION_ENABLED
             value: ${AUTOMATIC_SCOPE_MIGRATION_ENABLED}
           - name: REDHAT_SSO
@@ -1153,6 +1226,14 @@ objects:
               value: ${UNLEASH_REFRESH_INTERVAL}
             - name: UNLEASH_REQUEST_TIMEOUT
               value: ${UNLEASH_REQUEST_TIMEOUT}
+            - name: ROOT_SCOPE_PERMISSIONS
+              value: ${ROOT_SCOPE_PERMISSIONS}
+            - name: TENANT_SCOPE_PERMISSIONS
+              value: ${TENANT_SCOPE_PERMISSIONS}
+            - name: DEFAULT_SCOPE_PERMISSIONS
+              value: ${DEFAULT_SCOPE_PERMISSIONS}
+            - name: ALL_SCOPE_PERMISSIONS
+              value: ${ALL_SCOPE_PERMISSIONS}
             ######## Following envs are different from worker
             - name: S3_AWS_ACCESS_KEY_ID
               valueFrom:
@@ -1396,6 +1477,8 @@ objects:
               value: ${TENANT_SCOPE_PERMISSIONS}
             - name: DEFAULT_SCOPE_PERMISSIONS
               value: ${DEFAULT_SCOPE_PERMISSIONS}
+            - name: ALL_SCOPE_PERMISSIONS
+              value: ${ALL_SCOPE_PERMISSIONS}
             - name: AUTOMATIC_SCOPE_MIGRATION_ENABLED
               value: ${AUTOMATIC_SCOPE_MIGRATION_ENABLED}
             ######## Following envs are different from worker
@@ -2095,6 +2178,18 @@ parameters:
 - name: KAFKA_PRINCIPAL_CLEANUP_DLQ_TOPIC
   description: Kafka Dead Letter Queue topic for failed principal cleanup messages (optional, prevents infinite retry loops)
   value: ''
+- name: KAFKA_PRINCIPAL_CLEANUP_SESSION_TIMEOUT_MS
+  description: Kafka consumer session timeout (ms) for the principal-cleanup consumer group; sized so the ~60s beat + 15s drain cycle does not trigger LeaveGroup timeouts.
+  value: '45000'
+- name: KAFKA_PRINCIPAL_CLEANUP_HEARTBEAT_INTERVAL_MS
+  description: Kafka consumer heartbeat interval (ms) for the principal-cleanup consumer group.
+  value: '15000'
+- name: KAFKA_PRINCIPAL_CLEANUP_MAX_POLL_INTERVAL_MS
+  description: Kafka consumer max poll interval (ms) for the principal-cleanup consumer group.
+  value: '300000'
+- name: KAFKA_PRINCIPAL_CLEANUP_STATIC_MEMBERSHIP_ENABLED
+  description: Enable static consumer-group membership (group.instance.id) for the principal-cleanup consumer to avoid full rebalance on each periodic rejoin.
+  value: 'True'
 - name: ROOT_SCOPE_PERMISSIONS
   description: Comma-separated list of permissions that bind to root workspace scope (supports wildcards like rbac:*:read)
   value: ''
@@ -2103,6 +2198,9 @@ parameters:
   value: ''
 - name: DEFAULT_SCOPE_PERMISSIONS
   description: Comma-separated list of permissions that bind to default workspace scope (more specific patterns override broader TENANT_SCOPE_PERMISSIONS entries)
+  value: ''
+- name: ALL_SCOPE_PERMISSIONS
+  description: Comma-separated list of scope-agnostic permissions that can coexist with any other scope (supports wildcards like rbac:role_binding:*)
   value: ''
 - name: AUTOMATIC_SCOPE_MIGRATION_ENABLED
   description: |

@@ -309,6 +309,22 @@ def create_mock_kafka_message(message_body, partition=0, offset=0):
     return mock_message
 
 
+IT_MANAGED_KAFKA_CLUSTERS = {
+    "it_managed": {
+        "servers": ["it-broker-1:9096", "it-broker-2:9096"],
+        "auth": {
+            "bootstrap_servers": ["it-broker-1:9096", "it-broker-2:9096"],
+            "sasl_plain_username": "it-user",
+            "sasl_plain_password": "it-pass",
+            "sasl_mechanism": "SCRAM-SHA-512",
+            "security_protocol": "SASL_SSL",
+            "retries": 5,
+        },
+    },
+}
+
+
+@override_settings(KAFKA_CLUSTERS=IT_MANAGED_KAFKA_CLUSTERS)
 class PrincipalKafkaTests(IdentityRequest):
     """Test the principal processor functions with Kafka."""
 
@@ -368,6 +384,38 @@ class PrincipalKafkaTests(IdentityRequest):
         self.assertIn("test-rbac-service", group_id)
         # Verify it includes the topic discriminator
         self.assertIn("principal-cleanup", group_id)
+
+    @patch("management.principal.cleaner.KafkaConsumer")
+    @patch("management.principal.cleaner.settings.KAFKA_PRINCIPAL_CLEANUP_TOPIC", "test-topic")
+    def test_consumer_targets_it_managed_cluster(self, consumer_mock):
+        """The cleanup consumer connects to the IT-managed cluster, not the Clowder one."""
+        consumer_instance = MagicMock()
+        consumer_instance.__iter__.return_value = iter([])
+        consumer_mock.return_value = consumer_instance
+
+        process_principal_events_from_kafka()
+
+        consumer_mock.assert_called_once()
+        call_kwargs = consumer_mock.call_args[1]
+        self.assertEqual(
+            call_kwargs["bootstrap_servers"],
+            ["it-broker-1:9096", "it-broker-2:9096"],
+        )
+        # SASL auth from the it_managed profile is forwarded to the consumer...
+        self.assertEqual(call_kwargs["sasl_plain_username"], "it-user")
+        self.assertEqual(call_kwargs["sasl_mechanism"], "SCRAM-SHA-512")
+        self.assertEqual(call_kwargs["security_protocol"], "SASL_SSL")
+        # ...but producer-only configs are stripped so KafkaConsumer does not reject them.
+        self.assertNotIn("retries", call_kwargs)
+
+    @patch("management.principal.cleaner.KafkaConsumer")
+    @patch("management.principal.cleaner.settings.KAFKA_PRINCIPAL_CLEANUP_TOPIC", "test-topic")
+    @override_settings(KAFKA_CLUSTERS={})
+    def test_consumer_no_ops_when_it_managed_unconfigured(self, consumer_mock):
+        """With no IT-managed cluster configured, the consumer safely no-ops (no Clowder fallback)."""
+        process_principal_events_from_kafka()
+
+        consumer_mock.assert_not_called()
 
     @patch(
         "management.principal.proxy.PrincipalProxy._request_principals",
@@ -1229,7 +1277,7 @@ class PrincipalKafkaTestsWithV2TenantBootstrap(PrincipalKafkaTests):
         tenant.refresh_from_db()
         self.assertFalse(tenant.ready)
 
-    @patch("management.relation_replicator.outbox_replicator.OutboxReplicator.replicate")
+    @patch("management.inventory_replicator.outbox_replicator.OutboxReplicator.replicate")
     @patch(
         "management.principal.proxy.PrincipalProxy.request_filtered_principals",
         return_value={"status_code": 200, "data": []},
@@ -1336,3 +1384,181 @@ class PrincipalKafkaTestsWithV2TenantBootstrap(PrincipalKafkaTests):
                 )
             ),
         )
+
+    @patch("management.principal.cleaner.KafkaConsumer")
+    @patch("management.principal.cleaner.settings.KAFKA_PRINCIPAL_CLEANUP_TOPIC", "test-topic")
+    @patch("management.principal.cleaner.settings.SA_NAME", "test-rbac")
+    @patch("management.principal.cleaner.settings.ENV_NAME", "stage")
+    def test_kafka_config_includes_static_membership_and_timeouts(self, consumer_mock):
+        """Test that kafka_config includes group_instance_id and timeout tuning by default."""
+        consumer_instance = MagicMock()
+        consumer_instance.__iter__.return_value = iter([])
+        consumer_mock.return_value = consumer_instance
+
+        process_principal_events_from_kafka()
+
+        consumer_mock.assert_called_once()
+        call_kwargs = consumer_mock.call_args[1]
+
+        # Assert static membership is enabled by default
+        self.assertIn("group_instance_id", call_kwargs)
+        expected_instance_id = "test-rbac-stage-principal-cleanup-static"
+        self.assertEqual(call_kwargs["group_instance_id"], expected_instance_id)
+
+        # Assert timeout values are configured
+        self.assertIn("session_timeout_ms", call_kwargs)
+        self.assertIn("heartbeat_interval_ms", call_kwargs)
+        self.assertIn("max_poll_interval_ms", call_kwargs)
+
+        # Verify default values (45s session, 15s heartbeat, 300s max_poll)
+        self.assertEqual(call_kwargs["session_timeout_ms"], 45000)
+        self.assertEqual(call_kwargs["heartbeat_interval_ms"], 15000)
+        self.assertEqual(call_kwargs["max_poll_interval_ms"], 300000)
+
+        consumer_instance.close.assert_called_once()
+
+    @patch("management.principal.cleaner.KafkaConsumer")
+    @patch("management.principal.cleaner.settings.KAFKA_PRINCIPAL_CLEANUP_TOPIC", "test-topic")
+    @patch("management.principal.cleaner.settings.SA_NAME", "test-rbac")
+    @patch("management.principal.cleaner.settings.ENV_NAME", "stage")
+    @override_settings(KAFKA_PRINCIPAL_CLEANUP_STATIC_MEMBERSHIP_ENABLED=False)
+    def test_kafka_config_static_membership_can_be_disabled(self, consumer_mock):
+        """Test that static membership can be disabled via setting."""
+        consumer_instance = MagicMock()
+        consumer_instance.__iter__.return_value = iter([])
+        consumer_mock.return_value = consumer_instance
+
+        process_principal_events_from_kafka()
+
+        consumer_mock.assert_called_once()
+        call_kwargs = consumer_mock.call_args[1]
+
+        # Assert group_instance_id is NOT present when static membership disabled
+        self.assertNotIn("group_instance_id", call_kwargs)
+
+        # Timeouts should still be configured
+        self.assertIn("session_timeout_ms", call_kwargs)
+        self.assertIn("heartbeat_interval_ms", call_kwargs)
+        self.assertIn("max_poll_interval_ms", call_kwargs)
+
+        consumer_instance.close.assert_called_once()
+
+    @patch("management.principal.cleaner.KafkaConsumer")
+    @patch("management.principal.cleaner.settings.KAFKA_PRINCIPAL_CLEANUP_TOPIC", "test-topic")
+    @patch("management.principal.cleaner.settings.SA_NAME", "test-rbac")
+    @patch("management.principal.cleaner.settings.ENV_NAME", "stage")
+    @override_settings(
+        KAFKA_PRINCIPAL_CLEANUP_SESSION_TIMEOUT_MS=60000,
+        KAFKA_PRINCIPAL_CLEANUP_HEARTBEAT_INTERVAL_MS=20000,
+        KAFKA_PRINCIPAL_CLEANUP_MAX_POLL_INTERVAL_MS=600000,
+    )
+    def test_kafka_config_timeouts_configurable(self, consumer_mock):
+        """Test that timeout values are configurable via settings."""
+        consumer_instance = MagicMock()
+        consumer_instance.__iter__.return_value = iter([])
+        consumer_mock.return_value = consumer_instance
+
+        process_principal_events_from_kafka()
+
+        consumer_mock.assert_called_once()
+        call_kwargs = consumer_mock.call_args[1]
+
+        # Assert custom timeout values are used
+        self.assertEqual(call_kwargs["session_timeout_ms"], 60000)
+        self.assertEqual(call_kwargs["heartbeat_interval_ms"], 20000)
+        self.assertEqual(call_kwargs["max_poll_interval_ms"], 600000)
+
+        consumer_instance.close.assert_called_once()
+
+    @patch("management.principal.cleaner._release_kafka_consumer_lock")
+    @patch("management.principal.cleaner._try_acquire_kafka_consumer_lock", return_value=False)
+    @patch("management.principal.cleaner.KafkaConsumer")
+    @patch("management.principal.cleaner.settings.KAFKA_PRINCIPAL_CLEANUP_TOPIC", "test-topic")
+    def test_single_consumer_guard_no_op_when_lock_not_acquired(
+        self, consumer_mock, lock_acquire_mock, lock_release_mock
+    ):
+        """Test that consumer no-ops cleanly when lock is not acquired (another worker running)."""
+        process_principal_events_from_kafka()
+
+        # Lock was attempted (inside try block)
+        lock_acquire_mock.assert_called_once()
+
+        # KafkaConsumer was NOT constructed (guard prevented it)
+        consumer_mock.assert_not_called()
+
+        # Lock release should NOT be called when lock was not acquired (consumer_lock_held=False)
+        lock_release_mock.assert_not_called()
+
+    @patch("management.principal.cleaner._release_kafka_consumer_lock")
+    @patch("management.principal.cleaner._try_acquire_kafka_consumer_lock", return_value=True)
+    @patch("management.principal.cleaner.KafkaConsumer")
+    @patch("management.principal.cleaner.settings.KAFKA_PRINCIPAL_CLEANUP_TOPIC", "test-topic")
+    def test_consumer_lock_released_in_finally_when_acquired(
+        self, consumer_mock, lock_acquire_mock, lock_release_mock
+    ):
+        """Test that consumer lock is released in finally block when it was acquired."""
+        consumer_instance = MagicMock()
+        consumer_instance.__iter__.return_value = iter([])
+        consumer_mock.return_value = consumer_instance
+
+        process_principal_events_from_kafka()
+
+        # Lock acquired
+        lock_acquire_mock.assert_called_once()
+
+        # Consumer constructed and closed
+        consumer_mock.assert_called_once()
+        consumer_instance.close.assert_called_once()
+
+        # Lock released in finally (because consumer_lock_held=True)
+        lock_release_mock.assert_called_once()
+
+    @patch("management.principal.cleaner._release_kafka_consumer_lock")
+    @patch("management.principal.cleaner._try_acquire_kafka_consumer_lock", return_value=True)
+    @patch("management.principal.cleaner.KafkaConsumer")
+    @patch("management.principal.cleaner.settings.KAFKA_PRINCIPAL_CLEANUP_TOPIC", "test-topic")
+    def test_consumer_lock_released_even_when_kafka_error_raised(
+        self, consumer_mock, lock_acquire_mock, lock_release_mock
+    ):
+        """Test that lock is released when KafkaError is raised after lock acquisition (designed error path)."""
+        # Import KafkaError to simulate the designed error path
+        from kafka.errors import KafkaError
+
+        # Make KafkaConsumer raise KafkaError after lock is acquired
+        consumer_mock.side_effect = KafkaError("Simulated Kafka connection error")
+
+        # KafkaError should NOT propagate (caught by except KafkaError clause)
+        process_principal_events_from_kafka()
+
+        # Lock was acquired
+        lock_acquire_mock.assert_called_once()
+
+        # Consumer construction was attempted
+        consumer_mock.assert_called_once()
+
+        # Lock MUST still be released in finally (because consumer_lock_held=True)
+        lock_release_mock.assert_called_once()
+
+    @patch("management.principal.cleaner._release_kafka_consumer_lock")
+    @patch("management.principal.cleaner._try_acquire_kafka_consumer_lock", return_value=True)
+    @patch("management.principal.cleaner.KafkaConsumer")
+    @patch("management.principal.cleaner.settings.KAFKA_PRINCIPAL_CLEANUP_TOPIC", "test-topic")
+    def test_consumer_lock_released_when_non_kafka_exception_propagates(
+        self, consumer_mock, lock_acquire_mock, lock_release_mock
+    ):
+        """Test that lock is released even when non-KafkaError exception propagates from constructor."""
+        # Make KafkaConsumer raise a generic exception (not KafkaError)
+        consumer_mock.side_effect = Exception("Simulated Kafka connection error")
+
+        # Generic Exception should propagate (NOT caught by except KafkaError clause)
+        with self.assertRaisesRegex(Exception, "Simulated Kafka connection error"):
+            process_principal_events_from_kafka()
+
+        # Lock was acquired
+        lock_acquire_mock.assert_called_once()
+
+        # Consumer construction was attempted
+        consumer_mock.assert_called_once()
+
+        # Lock MUST still be released in finally despite exception propagation (because consumer_lock_held=True)
+        lock_release_mock.assert_called_once()
