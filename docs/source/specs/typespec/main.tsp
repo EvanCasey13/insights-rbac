@@ -59,6 +59,19 @@ model Permission {
 }
 
 @example(#{
+    application: "rbac",
+    resource_type: "workspace",
+    operation: "read"
+})
+@doc("Permission data for role create and update operations. Unlike `Permission`, all fields are required.")
+model PermissionWrite {
+    application: string;
+    resource_type: string;
+    @doc("The action allowed by this permission (e.g. 'read', 'create', 'delete', 'update'). Equivalent to `verb` in the v1 API.")
+    operation: string;
+}
+
+@example(#{
     id: "550e8400-e29b-41d4-a716-446655440002",
     name: "Workspace Admin",
     description: "Full administrative access to workspace",
@@ -1452,7 +1465,7 @@ namespace Roles {
         @doc("A description of the role to help clarify its purpose. Does not need to be unique.")
         description?: string;
         @doc("List of permissions to assign to this role")
-        permissions: Permission[];
+        permissions: PermissionWrite[];
     }
 
     model RoleResponse<StatusCode extends int32> {
@@ -1895,7 +1908,7 @@ namespace Permissions {
         @doc("Filter by operation (e.g. 'read', 'create', 'delete', 'update'). You may also use a comma-separated list to match on multiple operation types. Equivalent to `verb` in the v1 API.")
         @query operation?: string;
 
-        @doc("Filter by full permission string(s). Comma-separated exact match (e.g. 'rbac:workspace:read' or 'rbac:workspace:read,inventory:hosts:write').")
+        @doc("Filter by full permission string. Partial/contains match (e.g. 'workspace' matches 'rbac:workspace:read'), Only a single value is supported.")
         @query permission?: string;
 
         @doc("When true, exclude wildcard/global permissions (where application, resource_type, or operation is '*') from the results.")

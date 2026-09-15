@@ -91,7 +91,7 @@
             "name": "permission",
             "in": "query",
             "required": false,
-            "description": "Filter by full permission string(s). Comma-separated exact match (e.g. 'rbac:workspace:read' or 'rbac:workspace:read,inventory:hosts:write').",
+            "description": "Filter by full permission string. Partial/contains match (e.g. 'workspace' matches 'rbac:workspace:read'), Only a single value is supported.",
             "schema": {
               "type": "string"
             },
@@ -3373,6 +3373,32 @@
           "requires": []
         }
       },
+      "PermissionWrite": {
+        "type": "object",
+        "required": [
+          "application",
+          "resource_type",
+          "operation"
+        ],
+        "properties": {
+          "application": {
+            "type": "string"
+          },
+          "resource_type": {
+            "type": "string"
+          },
+          "operation": {
+            "type": "string",
+            "description": "The action allowed by this permission (e.g. 'read', 'create', 'delete', 'update'). Equivalent to `verb` in the v1 API."
+          }
+        },
+        "description": "Permission data for role create and update operations. Unlike `Permission`, all fields are required.",
+        "example": {
+          "application": "rbac",
+          "resource_type": "workspace",
+          "operation": "read"
+        }
+      },
       "Permissions.Pagination": {
         "type": "object",
         "required": [
@@ -4570,7 +4596,7 @@
           "permissions": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/Permission"
+              "$ref": "#/components/schemas/PermissionWrite"
             },
             "description": "List of permissions to assign to this role"
           }
