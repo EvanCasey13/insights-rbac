@@ -1944,6 +1944,9 @@ namespace Permissions {
         @doc("When true, exclude wildcard/global permission options.")
         @query exclude_globals?: boolean = false;
 
+        @doc("Exclude permissions already assigned to the given role(s). Comma-separated list of role UUIDs.")
+        @query exclude_roles?: string;
+
         @doc("When true, only return options for applications allowed for role creation.")
         @query allowed_only?: boolean = false;
     ): PermissionOptionsResponse | Problems.CommonProblems;

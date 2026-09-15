@@ -332,6 +332,16 @@
             "explode": false
           },
           {
+            "name": "exclude_roles",
+            "in": "query",
+            "required": false,
+            "description": "Exclude permissions already assigned to the given role(s). Comma-separated list of role UUIDs.",
+            "schema": {
+              "type": "string"
+            },
+            "explode": false
+          },
+          {
             "name": "allowed_only",
             "in": "query",
             "required": false,
