@@ -1896,7 +1896,7 @@ namespace Permissions {
         @query allowed_only?: boolean = false;
 
         @doc("Control which fields are included in the response.")
-        @query fields?: FieldMask = "application,resource_type,operation,permission";
+        @query fields?: FieldMask = "application,resource_type,operation,permission,description,requires";
 
         @doc("Sort by specified field(s), prefix with '-' for descending order. Allowed fields: application, resource_type, operation, permission.")
         @query order_by?: OrderBy = "permission";
@@ -1920,13 +1920,19 @@ namespace Permissions {
         @doc("The field to return distinct values for. One of: application, resource_type, operation, permission.")
         @query field: "application" | "resource_type" | "operation" | "permission";
 
-        @doc("Filter by application name before computing distinct values. Comma-separated list supported.")
+        @doc("Filter by application name. You may use a comma-separated list to filter on multiple applications.")
         @query application?: string;
 
-        @doc("Filter by resource type before computing distinct values. Comma-separated list supported.")
+        @doc("Filter by resource type. You may use a comma-separated list to filter on multiple resource types.")
         @query resource_type?: string;
 
-        @doc("Filter by operation before computing distinct values. Comma-separated list supported.")
+        @doc("Filter by operation. You may use a comma-separated list to filter on multiple operations.")
         @query operation?: string;
+
+        @doc("When true, exclude wildcard/global permission options.")
+        @query exclude_globals?: boolean = false;
+
+        @doc("When true, only return options for applications allowed for role creation.")
+        @query allowed_only?: boolean = false;
     ): PermissionOptionsResponse | Problems.CommonProblems;
 }
