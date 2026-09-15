@@ -36,7 +36,7 @@ from management.models import Access, Group, Permission, Policy, Principal, Reso
 from rest_framework import status
 from rest_framework.test import APIClient
 from management.permissions.workspace_access import TARGET_WORKSPACE_ACCESS_DENIED_MESSAGE
-from management.relation_replicator.relation_replicator import ReplicationEventType
+from management.inventory_replicator.inventory_replicator import ReplicationEventType
 from management.workspace.serializer import WorkspaceEventSerializer
 from management.workspace.service import WorkspaceService
 from migration_tool.in_memory_tuples import (
@@ -221,8 +221,8 @@ class WorkspaceTestsCreateUpdateDelete(TransactionalWorkspaceViewTests):
         super().tearDown()
 
     @override_settings(REPLICATION_TO_RELATION_ENABLED=True)
-    @patch("management.relation_replicator.outbox_replicator.OutboxReplicator.replicate")
-    @patch("management.relation_replicator.outbox_replicator.OutboxReplicator.replicate_workspace")
+    @patch("management.inventory_replicator.outbox_replicator.OutboxReplicator.replicate")
+    @patch("management.inventory_replicator.outbox_replicator.OutboxReplicator.replicate_workspace")
     def test_create_workspace(self, replicate_workspace, replicate):
         """Test for creating a workspace."""
         replicate.side_effect = self.in_memory_replicator.replicate
@@ -580,6 +580,61 @@ class WorkspaceTestsCreateUpdateDelete(TransactionalWorkspaceViewTests):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data["name"], test_data["name"])
 
+    @override_settings(WORKSPACE_ORG_CREATION_LIMIT=4)
+    def test_create_workspaces_org_config_override_allows_over_global(self):
+        """A per-org org_config limit higher than the global setting allows create."""
+        self.tenant.org_config = {"workspace_creation_limit": 10}
+        self.tenant.save(update_fields=["org_config"])
+        try:
+            workspace_names = ["Workspace A", "Workspace B", "Workspace C", "Workspace D"]
+            for name in workspace_names:
+                Workspace.objects.create(
+                    name=name,
+                    description="New Workspace - description",
+                    tenant_id=self.tenant.id,
+                    parent_id=self.standard_workspace.id,
+                )
+
+            test_data = {"name": "New Workspace", "parent_id": self.standard_workspace.id}
+            url = reverse("v2_management:workspace-list")
+            client = APIClient()
+            response = client.post(url, test_data, format="json", **self.headers)
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+            self.assertEqual(response.data["name"], test_data["name"])
+        finally:
+            self.tenant.org_config = {}
+            self.tenant.save(update_fields=["org_config"])
+
+    @override_settings(WORKSPACE_ORG_CREATION_LIMIT=100)
+    def test_create_workspaces_org_config_override_lower_than_global(self):
+        """A per-org org_config limit lower than the global setting blocks create."""
+        self.tenant.org_config = {"workspace_creation_limit": 4}
+        self.tenant.save(update_fields=["org_config"])
+        try:
+            workspace_names = ["Workspace A", "Workspace B", "Workspace C", "Workspace D"]
+            for name in workspace_names:
+                Workspace.objects.create(
+                    name=name,
+                    description="New Workspace - description",
+                    tenant_id=self.tenant.id,
+                    parent_id=self.standard_workspace.id,
+                )
+
+            test_data = {"name": "New Workspace", "parent_id": self.standard_workspace.id}
+            url = reverse("v2_management:workspace-list")
+            client = APIClient()
+            response = client.post(url, test_data, format="json", **self.headers)
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            resp_body = json.loads(response.content.decode())
+            self.assertEqual(
+                resp_body.get("detail"),
+                "Workspace limit reached (6/4); please free up capacity by deleting empty workspaces"
+                " or consolidating those with similar users and role bindings.",
+            )
+        finally:
+            self.tenant.org_config = {}
+            self.tenant.save(update_fields=["org_config"])
+
     @override_settings(WORKSPACE_HIERARCHY_DEPTH_LIMIT=5)
     def test_create_workspaces_exceed_hierarchy_depth_limit(self):
         """
@@ -768,8 +823,8 @@ class WorkspaceTestsCreateUpdateDelete(TransactionalWorkspaceViewTests):
                 self.assertEqual(str(workspace.parent_id), workspace_ids[i - 1])
 
     @override_settings(REPLICATION_TO_RELATION_ENABLED=True)
-    @patch("management.relation_replicator.outbox_replicator.OutboxReplicator.replicate")
-    @patch("management.relation_replicator.outbox_replicator.OutboxReplicator.replicate_workspace")
+    @patch("management.inventory_replicator.outbox_replicator.OutboxReplicator.replicate")
+    @patch("management.inventory_replicator.outbox_replicator.OutboxReplicator.replicate_workspace")
     def test_update_workspace(self, replicate_workspace, replicate):
         """Test for updating a workspace."""
         replicate.side_effect = self.in_memory_replicator.replicate
@@ -1512,8 +1567,8 @@ class WorkspaceTestsCreateUpdateDelete(TransactionalWorkspaceViewTests):
         self.assertEqual(response.data.get("type"), Workspace.Types.STANDARD)
 
     @override_settings(REPLICATION_TO_RELATION_ENABLED=True)
-    @patch("management.relation_replicator.outbox_replicator.OutboxReplicator.replicate")
-    @patch("management.relation_replicator.outbox_replicator.OutboxReplicator.replicate_workspace")
+    @patch("management.inventory_replicator.outbox_replicator.OutboxReplicator.replicate")
+    @patch("management.inventory_replicator.outbox_replicator.OutboxReplicator.replicate_workspace")
     def test_delete_workspace(self, replicate_workspace, replicate):
         replicate.side_effect = self.in_memory_replicator.replicate
         workspace_data = {
@@ -1834,7 +1889,7 @@ class WorkspaceTestsCreateUpdateDelete(TransactionalWorkspaceViewTests):
         self.assertEqual(mock_super_create.call_count, 1)
 
     @patch(
-        "management.workspace.relation_api_dual_write_workspace_handler.RelationApiDualWriteWorkspaceHandler._replicate"
+        "management.workspace.inventory_api_dual_write_workspace_handler.InventoryApiDualWriteWorkspaceHandler._replicate"
     )
     def test_create_dual_write_operational_error_propagates_for_retry(self, mock_replicate):
         """
@@ -1861,7 +1916,7 @@ class WorkspaceTestsCreateUpdateDelete(TransactionalWorkspaceViewTests):
         self.assertEqual(response["Retry-After"], "1")
 
     @patch(
-        "management.workspace.relation_api_dual_write_workspace_handler.RelationApiDualWriteWorkspaceHandler._replicate"
+        "management.workspace.inventory_api_dual_write_workspace_handler.InventoryApiDualWriteWorkspaceHandler._replicate"
     )
     def test_create_dual_write_non_db_exception_raises_dual_write_error(self, mock_replicate):
         """
@@ -1870,7 +1925,7 @@ class WorkspaceTestsCreateUpdateDelete(TransactionalWorkspaceViewTests):
         Only OperationalError (serialization/deadlock) should propagate for retry.
         Other exceptions should remain wrapped in DualWriteException and bubble up.
         """
-        from management.relation_replicator.relation_replicator import DualWriteException
+        from management.inventory_replicator.inventory_replicator import DualWriteException
 
         mock_replicate.side_effect = DualWriteException(ValueError("some other error"))
 
@@ -1932,7 +1987,7 @@ class WorkspaceMove(TransactionalWorkspaceViewTests):
             )
 
     @override_settings(REPLICATION_TO_RELATION_ENABLED=True)
-    @patch("management.relation_replicator.outbox_replicator.OutboxReplicator.replicate")
+    @patch("management.inventory_replicator.outbox_replicator.OutboxReplicator.replicate")
     def test_success_move_workspace(self, replicate):
         replicate.side_effect = self.in_memory_replicator.replicate
 
@@ -2753,7 +2808,7 @@ class WorkspaceMove(TransactionalWorkspaceViewTests):
         self.assertEqual(mock_serializer_move.call_count, 1)
 
     @patch(
-        "management.workspace.relation_api_dual_write_workspace_handler.RelationApiDualWriteWorkspaceHandler._replicate"
+        "management.workspace.inventory_api_dual_write_workspace_handler.InventoryApiDualWriteWorkspaceHandler._replicate"
     )
     def test_move_dual_write_operational_error_propagates_for_retry(self, mock_replicate):
         """
@@ -4345,8 +4400,8 @@ class WorkspaceAuditLogTests(TransactionalWorkspaceViewTests):
         )
 
     @override_settings(REPLICATION_TO_RELATION_ENABLED=True)
-    @patch("management.relation_replicator.outbox_replicator.OutboxReplicator.replicate")
-    @patch("management.relation_replicator.outbox_replicator.OutboxReplicator.replicate_workspace")
+    @patch("management.inventory_replicator.outbox_replicator.OutboxReplicator.replicate")
+    @patch("management.inventory_replicator.outbox_replicator.OutboxReplicator.replicate_workspace")
     def test_delete_workspace_audit_log(self, replicate_workspace, replicate):
         """Test that deleting a workspace creates an audit log entry."""
         replicate.side_effect = self.in_memory_replicator.replicate
@@ -4373,7 +4428,7 @@ class WorkspaceAuditLogTests(TransactionalWorkspaceViewTests):
         self._assert_audit_log(action=AuditLog.DELETE, description="Deleted workspace: Workspace To Delete")
 
     @override_settings(REPLICATION_TO_RELATION_ENABLED=True)
-    @patch("management.relation_replicator.outbox_replicator.OutboxReplicator.replicate")
+    @patch("management.inventory_replicator.outbox_replicator.OutboxReplicator.replicate")
     def test_move_workspace_audit_log(self, replicate):
         """Test that moving a workspace creates an audit log entry."""
         replicate.side_effect = self.in_memory_replicator.replicate

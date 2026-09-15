@@ -534,6 +534,18 @@ RBAC_KAFKA_CUSTOM_CONSUMER_BROKER = ENVIRONMENT.get_value("RBAC_KAFKA_CUSTOM_CON
 
 KAFKA_PRINCIPAL_CLEANUP_TOPIC = ENVIRONMENT.get_value("KAFKA_PRINCIPAL_CLEANUP_TOPIC", default="")
 KAFKA_PRINCIPAL_CLEANUP_DLQ_TOPIC = ENVIRONMENT.get_value("KAFKA_PRINCIPAL_CLEANUP_DLQ_TOPIC", default="")
+KAFKA_PRINCIPAL_CLEANUP_SESSION_TIMEOUT_MS = ENVIRONMENT.get_value(
+    "KAFKA_PRINCIPAL_CLEANUP_SESSION_TIMEOUT_MS", default=45000
+)
+KAFKA_PRINCIPAL_CLEANUP_HEARTBEAT_INTERVAL_MS = ENVIRONMENT.get_value(
+    "KAFKA_PRINCIPAL_CLEANUP_HEARTBEAT_INTERVAL_MS", default=15000
+)
+KAFKA_PRINCIPAL_CLEANUP_MAX_POLL_INTERVAL_MS = ENVIRONMENT.get_value(
+    "KAFKA_PRINCIPAL_CLEANUP_MAX_POLL_INTERVAL_MS", default=300000
+)
+KAFKA_PRINCIPAL_CLEANUP_STATIC_MEMBERSHIP_ENABLED = ENVIRONMENT.bool(
+    "KAFKA_PRINCIPAL_CLEANUP_STATIC_MEMBERSHIP_ENABLED", default=True
+)
 
 # if we don't enable KAFKA we can't use the notifications
 if not KAFKA_ENABLED:
@@ -608,6 +620,29 @@ if KAFKA_ENABLED:
     if clowder_principal_cleanup_dlq_topic:
         KAFKA_PRINCIPAL_CLEANUP_DLQ_TOPIC = clowder_principal_cleanup_dlq_topic.name
 
+
+IT_KAFKA_BOOTSTRAP_SERVERS = ENVIRONMENT.get_value("IT_KAFKA_BOOTSTRAP_SERVERS", default="")
+IT_KAFKA_USERNAME = ENVIRONMENT.get_value("IT_KAFKA_USERNAME", default="")
+IT_KAFKA_PASSWORD = ENVIRONMENT.get_value("IT_KAFKA_PASSWORD", default="")
+IT_KAFKA_SASL_MECHANISM = ENVIRONMENT.get_value("IT_KAFKA_SASL_MECHANISM", default="SCRAM-SHA-512")
+IT_KAFKA_SECURITY_PROTOCOL = ENVIRONMENT.get_value("IT_KAFKA_SECURITY_PROTOCOL", default="SASL_SSL")
+
+IT_KAFKA_SERVERS = [server.strip() for server in IT_KAFKA_BOOTSTRAP_SERVERS.split(",") if server.strip()]
+IT_KAFKA_AUTH = {}
+if IT_KAFKA_SERVERS and IT_KAFKA_USERNAME and IT_KAFKA_PASSWORD:
+    IT_KAFKA_AUTH = {
+        "bootstrap_servers": IT_KAFKA_SERVERS,
+        "sasl_plain_username": IT_KAFKA_USERNAME,
+        "sasl_plain_password": IT_KAFKA_PASSWORD,
+        "sasl_mechanism": IT_KAFKA_SASL_MECHANISM.upper(),
+        "security_protocol": IT_KAFKA_SECURITY_PROTOCOL.upper(),
+        "retries": 5,  # producer-only; PRODUCER_ONLY_CONFIGS strips it for consumers
+    }
+
+KAFKA_CLUSTERS = {
+    "it_managed": {"servers": IT_KAFKA_SERVERS, "auth": IT_KAFKA_AUTH},
+}
+
 # BOP TLS settings
 if ENVIRONMENT.bool("CLOWDER_ENABLED", default=False) and ENVIRONMENT.bool("USE_CLOWDER_CA_FOR_BOP", default=False):
     BOP_CLIENT_CERT_PATH = LoadedConfig.tlsCAPath
@@ -675,13 +710,6 @@ if ENVIRONMENT.bool("CLOWDER_ENABLED", default=False):
             f"Falling back to default RELATION_API_SERVER value: {RELATION_API_SERVER}"
         )
 
-RELATIONS_API_CLIENT_ID = ENVIRONMENT.get_value("RELATION_API_CLIENT_ID", default="")
-RELATIONS_API_CLIENT_SECRET = ENVIRONMENT.get_value("RELATION_API_CLIENT_SECRET", default="")
-RELATIONS_API_TOKEN_URL = ENVIRONMENT.get_value(
-    "RELATIONS_API_TOKEN_URL",
-    default="https://sso.stage.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token",
-)
-
 INVENTORY_API_CLIENT_ID = ENVIRONMENT.get_value("INVENTORY_API_CLIENT_ID", default="")
 INVENTORY_API_CLIENT_SECRET = ENVIRONMENT.get_value("INVENTORY_API_CLIENT_SECRET", default="")
 INVENTORY_API_TOKEN_URL = ENVIRONMENT.get_value(
@@ -748,6 +776,7 @@ WORKSPACE_ACCESS_TIMING_ENABLED = ENVIRONMENT.bool("WORKSPACE_ACCESS_TIMING_ENAB
 ROOT_SCOPE_PERMISSIONS = ENVIRONMENT.get_value("ROOT_SCOPE_PERMISSIONS", default="")
 TENANT_SCOPE_PERMISSIONS = ENVIRONMENT.get_value("TENANT_SCOPE_PERMISSIONS", default="")
 DEFAULT_SCOPE_PERMISSIONS = ENVIRONMENT.get_value("DEFAULT_SCOPE_PERMISSIONS", default="")
+ALL_SCOPE_PERMISSIONS = ENVIRONMENT.get_value("ALL_SCOPE_PERMISSIONS", default="")
 
 # Whether to enable automatic scope migration during seeding. (This is intended to allow the migrations to be run
 # manually before enabling the automatic runs, thus preventing the migration running sequentially for all roles on the
