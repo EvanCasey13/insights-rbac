@@ -174,6 +174,7 @@ WorkspaceRelationChecker = WorkspaceRelationInventoryChecker()
 RoleRelationChecker = RoleRelationInventoryChecker()
 RoleBindingChecker = RoleBindingInventoryChecker()
 CustomRolePermissionCheckerInstance = CustomRolePermissionChecker()
+CrossAccountRequestChecker = CrossAccountRequestInventoryChecker()
 
 
 def tenant_is_modified(tenant_name=None, org_id=None):
@@ -2546,18 +2547,22 @@ def verify_migration(request, org_id):
     """GET to run a combined, read-only check that an org's data is correctly migrated to Inventory.
 
     GET /_private/api/inventory/verify_migration/<org_id>/
-        ?role_limit=<role_limit>&binding_limit=<binding_limit>&group_limit=<group_limit>&dry_run=<true|false>
+        ?role_limit=<role_limit>&binding_limit=<binding_limit>&group_limit=<group_limit>
+        &car_limit=<car_limit>&workspace_limit=<workspace_limit>&dry_run=<true|false>
 
     Covers the full per-org relations-to-inventory migration surface: tenant bootstrap tuples,
     workspace parent/descendant relations, custom V2 role relations, role bindings (resource#binding,
     binding#role, binding#subject — previously had no verification path in production), group-principal
-    membership, and custom role permission tuples. `role_limit`/`binding_limit`/`group_limit` (each
-    default 25) cap how many roles/bindings/groups are checked per request, since each item checked
-    makes its own gRPC calls to Inventory and an unbounded scan of a large tenant could exceed the
-    request/worker timeout. Limits must be non-negative integers or the request returns 400.
-    A single bad item (e.g. a transient gRPC error) is recorded as an error for that item only and
-    does not abort the rest of its section. Seeded-role hierarchy is intentionally excluded: it is
-    platform-global, not tenant-scoped.
+    membership, custom role permission tuples, and approved cross-account request relations.
+    `role_limit`/`binding_limit`/`group_limit`/`car_limit`/`workspace_limit` (each default 25) cap
+    how many roles/bindings/groups/cross-account requests/workspace pairs are checked per request,
+    since each item checked makes its own gRPC calls to Inventory and an unbounded scan of a large
+    tenant could exceed the request/worker timeout — `workspace_limit` matters in particular because
+    `WorkspaceRelationChecker.check_workspace_descendants` issues one Inventory `Check` per pair,
+    sequentially, with no pagination. Limits must be non-negative integers or the request returns
+    400. A single bad item (e.g. a transient gRPC error) is recorded as an error for that item only
+    and does not abort the rest of its section. Seeded-role hierarchy is intentionally excluded: it
+    is platform-global, not tenant-scoped.
 
     Note the "roles" section checks v1 Role relations/uuids, while "role_permissions" checks the
     linked V2 RoleV2 (CustomRoleV2) uuid — these are different uuids for the same logical role, so
@@ -2590,6 +2595,8 @@ def verify_migration(request, org_id):
         role_limit = parse_positive_int_param(request, "role_limit", default=25)
         binding_limit = parse_positive_int_param(request, "binding_limit", default=25)
         group_limit = parse_positive_int_param(request, "group_limit", default=25)
+        car_limit = parse_positive_int_param(request, "car_limit", default=25)
+        workspace_limit = parse_positive_int_param(request, "workspace_limit", default=25)
     except ValueError as e:
         return JsonResponse({"detail": str(e)}, status=400)
 
@@ -2641,7 +2648,8 @@ def verify_migration(request, org_id):
 
     try:
         workspace_pairs = [
-            (str(w.id), str(w.parent_id)) for w in Workspace.objects.filter(tenant=tenant, parent__isnull=False)
+            (str(w.id), str(w.parent_id))
+            for w in Workspace.objects.filter(tenant=tenant, parent__isnull=False)[:workspace_limit]
         ]
         if dry_run:
             report["checks"]["workspaces"] = {"dry_run": True, "workspace_pairs_in_scope": workspace_pairs}
@@ -2696,9 +2704,31 @@ def verify_migration(request, org_id):
                     roles_all_correct = False
                 continue
 
+            if len(tuples) == 0:
+                # No tuples were generated — either REPLICATION_TO_RELATION_ENABLED is off, or the
+                # role currently has no bindings/permissions. Either way, check_role([]) would
+                # trivially return True (all() on an empty list), so report this as unverified
+                # rather than falsely claiming the role is correct.
+                role_results.append(
+                    {
+                        "role_uuid": str(role.uuid),
+                        "role_name": role.name,
+                        "tuples_generated": 0,
+                        "verified": False,
+                    }
+                )
+                continue
+
             serialized_relations = [json_format.MessageToDict(rel.as_message()) for rel in tuples]
             role_correct = RoleRelationChecker.check_role(serialized_relations, role.uuid)
-            role_results.append({"role_uuid": str(role.uuid), "role_name": role.name, "correct": role_correct})
+            role_results.append(
+                {
+                    "role_uuid": str(role.uuid),
+                    "role_name": role.name,
+                    "tuples_generated": len(tuples),
+                    "correct": role_correct,
+                }
+            )
             if not role_correct:
                 roles_all_correct = False
         except Exception as e:
@@ -2829,6 +2859,67 @@ def verify_migration(request, org_id):
         report["checks"]["role_permissions"]["dry_run"] = True
     if not permissions_all_correct:
         failed_checks.append("role_permissions")
+
+    car_results = []
+    cars_all_correct = True
+    approved_cars = CrossAccountRequest.objects.filter(
+        target_org=tenant.org_id, status=CrossAccountRequest.STATUS_APPROVED
+    ).prefetch_related("roles")[:car_limit]
+    for car in approved_cars:
+        try:
+            cross_account_roles = list(car.roles.all())
+            if not cross_account_roles:
+                # No roles means no relations were ever produced for this request; nothing to check.
+                car_results.append({"request_id": str(car.request_id), "tuples_generated": 0, "correct": True})
+                continue
+
+            tuples = InMemoryTuples()
+            with transaction.atomic():
+                car_dual_write_handler = InventoryApiDualWriteCrossAccessHandler(
+                    cross_account_request=car,
+                    event_type=ReplicationEventType.APPROVE_CROSS_ACCOUNT_REQUEST,
+                    replicator=InMemoryRelationReplicator(tuples),
+                )
+                car_dual_write_handler.generate_relations_to_add_roles(cross_account_roles)
+                car_dual_write_handler.replicate()
+                # Ensure that we don't accidentally update any models.
+                transaction.set_rollback(True)
+
+            if dry_run:
+                validation = validate_generated_tuples(tuples)
+                car_results.append(
+                    {
+                        "request_id": str(car.request_id),
+                        "tuples_generated": len(tuples),
+                        "checked": False,
+                        "validation": validation,
+                    }
+                )
+                if not validation["valid"]:
+                    cars_all_correct = False
+                continue
+
+            if len(tuples) == 0:
+                # Roles exist but no tuples were generated — e.g. REPLICATION_TO_RELATION_ENABLED
+                # is off. check_cross_account_request([]) trivially returns True, so report this
+                # as unverified rather than falsely claiming the request is correct.
+                car_results.append({"request_id": str(car.request_id), "tuples_generated": 0, "verified": False})
+                continue
+
+            car_correct = CrossAccountRequestChecker.check_cross_account_request(list(tuples), str(car.request_id))
+            car_results.append(
+                {"request_id": str(car.request_id), "tuples_generated": len(tuples), "correct": car_correct}
+            )
+            if not car_correct:
+                cars_all_correct = False
+        except Exception as e:
+            car_results.append({"request_id": str(car.request_id), "error": str(e)})
+            cars_all_correct = False
+    report["checks"]["cross_account_requests"] = {"correct": cars_all_correct, "requests_checked": car_results}
+    if dry_run:
+        report["checks"]["cross_account_requests"]["dry_run"] = True
+    if not cars_all_correct:
+        failed_checks.append("cross_account_requests")
 
     report["dry_run"] = dry_run
     report["overall_status"] = "fail" if failed_checks else "pass"
