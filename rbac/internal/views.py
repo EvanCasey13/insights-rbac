@@ -2553,7 +2553,13 @@ def verify_migration(request, org_id):
     Covers the full per-org relations-to-inventory migration surface: tenant bootstrap tuples,
     workspace parent/descendant relations, custom V2 role relations, role bindings (resource#binding,
     binding#role, binding#subject — previously had no verification path in production), group-principal
-    membership, custom role permission tuples, and approved cross-account request relations.
+    membership, custom role permission tuples, and approved cross-account request relations. Also
+    includes a "pipeline_health" section: a tenant-agnostic liveness check of the async
+    outbox -> Debezium -> Kafka replication pipeline (Debezium connector status + Postgres
+    replication slot state) that always runs, in both dry_run and live mode, since it doesn't call
+    Inventory at all. It's a liveness check, not a correctness check — a healthy pipeline says
+    nothing about whether the other sections will pass, and vice versa; see
+    get_pipeline_health_checks for details.
     `role_limit`/`binding_limit`/`group_limit`/`car_limit`/`workspace_limit` (each default 25) cap
     how many roles/bindings/groups/cross-account requests/workspace pairs are checked per request,
     since each item checked makes its own gRPC calls to Inventory and an unbounded scan of a large
@@ -2921,6 +2927,13 @@ def verify_migration(request, org_id):
     if not cars_all_correct:
         failed_checks.append("cross_account_requests")
 
+    # Pipeline health is tenant-agnostic infrastructure liveness (Debezium/Kafka), not per-org
+    # tuple correctness, and doesn't call Inventory — always run it, even in dry_run mode.
+    pipeline_checks, pipeline_unhealthy = get_pipeline_health_checks()
+    report["checks"]["pipeline_health"] = {"correct": not pipeline_unhealthy, **pipeline_checks}
+    if pipeline_unhealthy:
+        failed_checks.append("pipeline_health")
+
     report["dry_run"] = dry_run
     report["overall_status"] = "fail" if failed_checks else "pass"
     report["failed_checks"] = failed_checks
@@ -2931,6 +2944,73 @@ def verify_migration(request, org_id):
     }
 
     return JsonResponse(report, status=200)
+
+
+def get_pipeline_health_checks() -> tuple[dict, list[str]]:
+    """Check liveness of the async outbox -> Debezium -> Kafka replication pipeline.
+
+    This is tenant-agnostic infrastructure health, not per-org tuple correctness: it confirms
+    the delivery mechanism is currently up and not stuck, not that any specific tuple has
+    actually transited it. Read-only against every dependency: an HTTP GET to the Kafka Connect
+    REST API for connector status, and a `SELECT` against `pg_replication_slots` for the
+    Postgres logical replication slot(s) Debezium reads from. Nothing is written anywhere.
+
+    Returns a (checks, unhealthy) tuple, where `checks` is a dict of check-name -> result ready
+    to merge into a report's "checks", and `unhealthy` lists the names of any failing checks.
+    """
+    checks: dict = {}
+    unhealthy = []
+
+    if not settings.KAFKA_CONNECT_URL:
+        checks["debezium_connector"] = {
+            "configured": False,
+            "detail": "KAFKA_CONNECT_URL is not configured.",
+        }
+    else:
+        try:
+            response = requests.get(
+                f"{settings.KAFKA_CONNECT_URL}/connectors/rbac-debezium/status",
+                timeout=5,
+            )
+            response.raise_for_status()
+            data = response.json()
+            connector_state = data.get("connector", {}).get("state", "")
+            tasks = data.get("tasks") or []
+            task_state = tasks[0].get("state", "") if tasks else ""
+            healthy = connector_state == "RUNNING" and task_state == "RUNNING"
+            checks["debezium_connector"] = {
+                "configured": True,
+                "connector_state": connector_state,
+                "task_state": task_state,
+                "healthy": healthy,
+            }
+            if not healthy:
+                unhealthy.append("debezium_connector")
+        except Exception as e:
+            checks["debezium_connector"] = {"configured": True, "healthy": False, "error": str(e)}
+            unhealthy.append("debezium_connector")
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT slot_name, active, "
+                "pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) AS lag_bytes "
+                "FROM pg_replication_slots WHERE plugin = 'pgoutput'"
+            )
+            rows = cursor.fetchall()
+        slots = [{"slot_name": row[0], "active": row[1], "lag_bytes": row[2]} for row in rows]
+        # Debezium's slot name isn't hardcoded here since it isn't fixed by config in this repo
+        # (Debezium defaults to "debezium" when unset) — report every pgoutput slot found rather
+        # than guessing a name and silently missing the real one.
+        slots_healthy = any(slot["active"] for slot in slots)
+        checks["replication_slots"] = {"slots": slots, "healthy": slots_healthy}
+        if not slots_healthy:
+            unhealthy.append("replication_slots")
+    except Exception as e:
+        checks["replication_slots"] = {"healthy": False, "error": str(e)}
+        unhealthy.append("replication_slots")
+
+    return checks, unhealthy
 
 
 def send_kafka_test_message(request):
