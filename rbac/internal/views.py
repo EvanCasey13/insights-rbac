@@ -2990,15 +2990,12 @@ def get_pipeline_health_checks() -> tuple[dict, list[str]]:
             checks["debezium_connector"] = {"configured": True, "healthy": False, "error": str(e)}
             unhealthy.append("debezium_connector")
 
+    slot_query = "SELECT slot_name, active FROM pg_replication_slots WHERE plugin = 'pgoutput'"
     try:
         with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT slot_name, active, "
-                "pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) AS lag_bytes "
-                "FROM pg_replication_slots WHERE plugin = 'pgoutput'"
-            )
+            cursor.execute(slot_query)
             rows = cursor.fetchall()
-        slots = [{"slot_name": row[0], "active": row[1], "lag_bytes": row[2]} for row in rows]
+        slots = [{"slot_name": row[0], "active": row[1]} for row in rows]
         # Debezium's slot name isn't hardcoded here since it isn't fixed by config in this repo
         # (Debezium defaults to "debezium" when unset) — report every pgoutput slot found rather
         # than guessing a name and silently missing the real one.
