@@ -23,6 +23,7 @@ from django.urls import clear_url_caches, reverse
 from rest_framework import status
 from rest_framework.test import APIClient
 
+from api.models import Tenant
 from management.models import Access, Permission, Role
 from rbac import urls
 from tests.identity_request import IdentityRequest
@@ -157,3 +158,21 @@ class PermissionV2ViewsetTests(IdentityRequest):
         response = self.client.get(f"{self.options_url}?field=bogus", **self.headers)
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_list_permissions_tenant_isolation(self):
+        """Test that permissions from another tenant are not returned."""
+        other_tenant = Tenant.objects.create(
+            tenant_name="other_org",
+            org_id="99999",
+            ready=True,
+        )
+        Permission.objects.create(permission="other:secret:read", tenant=other_tenant)
+
+        response = self.client.get(self.list_url, **self.headers)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        permissions = {p["permission"] for p in response.data["data"]}
+        self.assertNotIn("other:secret:read", permissions)
+        self.assertEqual(len(response.data["data"]), 4)
+
+        other_tenant.delete()
