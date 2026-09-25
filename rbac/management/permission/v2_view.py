@@ -21,7 +21,7 @@ from django.db.models.functions import Collate
 from django_filters import rest_framework as filters
 from management.base_viewsets import BaseV2ViewSet
 from management.filters import CommonFilters
-from management.models import Access, Permission, Role
+from management.models import Permission
 from management.permission.service import PermissionService
 from management.permission.v2_serializer import PermissionV2ResponseSerializer, validate_fields_parameter
 from management.permissions.permission_access import PermissionAccessPermission
@@ -66,9 +66,9 @@ class PermissionV2Filter(CommonFilters):
             role_uuids_list = role_uuid_string.split(",")
             for uuid in role_uuids_list:
                 validate_uuid(uuid)
-            roles = Role.objects.filter(uuid__in=role_uuids_list, tenant=self.request.tenant)
-            permission_ids_to_exclude = Access.objects.filter(role__in=roles).values_list("permission_id", flat=True)
-            return queryset.exclude(id__in=permission_ids_to_exclude)
+            return PermissionService().exclude_permissions_for_roles(
+                queryset, role_uuids_list, self.request.tenant
+            )
         return queryset
 
     def allowed_only_filter(self, queryset, field, value):
