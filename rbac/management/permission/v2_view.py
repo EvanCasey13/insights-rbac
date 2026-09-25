@@ -66,9 +66,7 @@ class PermissionV2Filter(CommonFilters):
             role_uuids_list = role_uuid_string.split(",")
             for uuid in role_uuids_list:
                 validate_uuid(uuid)
-            return PermissionService().exclude_permissions_for_roles(
-                queryset, role_uuids_list, self.request.tenant
-            )
+            return PermissionService().exclude_permissions_for_roles(queryset, role_uuids_list, self.request.tenant)
         return queryset
 
     def allowed_only_filter(self, queryset, field, value):

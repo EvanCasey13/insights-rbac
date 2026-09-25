@@ -170,6 +170,10 @@ class PermissionV2ViewsetTests(IdentityRequest):
         from django.test.utils import CaptureQueriesContext
         from django.db import connection
 
+        # Warmup: prime Django's internal caches (content types, auth, etc.)
+        # so they don't inflate the baseline query count.
+        self.client.get(f"{self.list_url}?fields=permission,requires", **self.headers)
+
         # Baseline: existing permissions (one has a dependency).
         with CaptureQueriesContext(connection) as baseline_ctx:
             response = self.client.get(f"{self.list_url}?fields=permission,requires", **self.headers)
