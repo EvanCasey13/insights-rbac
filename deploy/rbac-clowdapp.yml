@@ -1007,19 +1007,19 @@ objects:
         - name: DATABASE_HOST
           valueFrom:
             secretKeyRef:
-              key: host
+              key: db.host
               name: db-clone
               optional: false
         - name: DATABASE_PORT
           valueFrom:
             secretKeyRef:
-              key: port
+              key: db.port
               name: db-clone
               optional: false
         - name: DATABASE_NAME
           valueFrom:
             secretKeyRef:
-              key: db
+              key: db.name
               name: db-clone
               optional: false
         - name: DATA_SOURCE_URI
@@ -1027,13 +1027,13 @@ objects:
         - name: DATA_SOURCE_USER
           valueFrom:
             secretKeyRef:
-              key: user
+              key: db.user
               name: db-clone
               optional: false
         - name: DATA_SOURCE_PASS
           valueFrom:
             secretKeyRef:
-              key: pass
+              key: db.password
               name: db-clone
               optional: false
         volumes:
