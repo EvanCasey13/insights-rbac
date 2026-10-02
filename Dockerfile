@@ -42,7 +42,6 @@ LABEL summary="$SUMMARY" \
 # gcc to compile some python packages (e.g. ciso8601)
 # postgresql-devel for psycopg2, libffi-devel for cffi
 RUN INSTALL_PKGS="glibc-langpack-en postgresql-server-devel postgresql gcc libffi-devel python3.12-devel curl" && \
-    sed -i -E '/\[legacy_sect\]/,/^\[/ s/^#?\s*activate\s*=\s*[01]/activate = 1/' /etc/pki/tls/openssl.cnf && \
     microdnf --nodocs -y upgrade && \
     microdnf -y --setopt=tsflags=nodocs --setopt=install_weak_deps=0 install $INSTALL_PKGS && \
     rpm -V $INSTALL_PKGS && \
