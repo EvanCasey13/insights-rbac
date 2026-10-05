@@ -179,24 +179,28 @@ class UtilsTests(IdentityRequest):
 
     @mock.patch("management.utils.verify_principal_with_proxy")
     def test_get_principal_created(self, mocked):
-        """Test that when a user principal does not exist in the database, it gets created."""
+        """Test that when a user principal does not exist in the database, it gets created with user_id."""
         # Build a non existent user principal.
         user = User()
         user.username = "abcde"
+        mocked.return_value = {
+            "status_code": 200,
+            "data": [{"username": "abcde", "user_id": "5840588", "is_org_admin": False}],
+        }
 
         request = mock.Mock()
         request.user = user
         request.tenant = self.tenant
         request.query_params = {}
 
-        # Attempt to fetch the service account principal from the database. Since it does not exist, it should create
-        # one.
+        # Attempt to fetch the principal from the database. Since it does not exist, it should create one.
         get_principal(username=user.username, request=request)
 
-        # Assert that the service account was properly created in the database.
-        created_service_account = Principal.objects.get(username=user.username)
-        self.assertEqual(created_service_account.type, "user")
-        self.assertEqual(created_service_account.username, user.username)
+        # Assert that the principal was properly created in the database with the BOP user_id.
+        created_principal = Principal.objects.get(username=user.username)
+        self.assertEqual(created_principal.type, "user")
+        self.assertEqual(created_principal.username, user.username)
+        self.assertEqual(created_principal.user_id, "5840588")
 
     @mock.patch("management.utils.verify_principal_with_proxy")
     def test_get_username_principal_not_service_account_validated(self, verify_principal_with_proxy: Mock):
@@ -340,7 +344,10 @@ class UtilsTests(IdentityRequest):
         mock_cache.get_principal.return_value = None
 
         # Mock the verify_principal_with_proxy to avoid external service calls.
-        mock_verify_principal.return_value = None
+        mock_verify_principal.return_value = {
+            "status_code": 200,
+            "data": [{"username": username, "user_id": "999001", "is_org_admin": False}],
+        }
 
         request = mock.Mock()
         request.tenant = self.tenant
@@ -359,6 +366,7 @@ class UtilsTests(IdentityRequest):
         self.assertEqual(result.username, username)
         self.assertEqual(result.tenant, self.tenant)
         self.assertEqual(result.type, "user")
+        self.assertEqual(result.user_id, "999001")
 
         # Verify that the principal actually exists in the database
         created_principal = Principal.objects.get(username=username, tenant=self.tenant)
@@ -390,8 +398,8 @@ class UtilsTests(IdentityRequest):
                     "org_id": "100001",
                     "is_org_admin": False,
                     "is_internal": False,
-                    "id": 52567473,
-                    "username": "user_a",
+                    "user_id": "52567473",
+                    "username": "abcde",
                     "account_number": "1111111",
                     "is_active": True,
                 }
@@ -399,7 +407,7 @@ class UtilsTests(IdentityRequest):
         },
     )
     def test_get_principal_from_request_created(self, mock_request_principals):
-        """Test that when a principal does not exist in the database, it gets created."""
+        """Test that when a principal does not exist in the database, it gets created with user_id."""
         username = "abcde"
 
         request = mock.Mock()
@@ -411,10 +419,13 @@ class UtilsTests(IdentityRequest):
         # Attempt to fetch the principal from the database. Since it does not exist, it should create one.
         get_principal_from_request(request=request)
 
-        # Assert that the principal was properly created in the database.
+        # Assert that the principal was properly created in the database with BOP user_id.
         created_principal = Principal.objects.get(username=username)
         self.assertEqual(created_principal.type, "user")
         self.assertEqual(created_principal.username, username)
+        self.assertEqual(created_principal.user_id, "52567473")
+        mock_request_principals.assert_called_once()
+        self.assertTrue(mock_request_principals.call_args.kwargs.get("options", {}).get("return_id"))
 
     @mock.patch(
         "management.principal.proxy.PrincipalProxy.request_filtered_principals",
