@@ -196,9 +196,14 @@ def main() -> int:
 
     mode = "w" if args.reset or start == 0 else "a"
     if args.reset or start == 0:
-        for path in (args.results_out, args.progress, args.retry_out):
+        for path in (args.results_out, args.progress):
             if path.exists():
                 path.unlink()
+    # Only delete the retry file on explicit --reset; a new run with a different
+    # fingerprint (start == 0) must not destroy a retry file left by another run.
+    if args.reset:
+        if args.retry_out.exists():
+            args.retry_out.unlink()
 
     print(
         f"Loaded {len(user_ids)} user_ids (active_only={args.active_only}); "
@@ -297,11 +302,16 @@ def main() -> int:
                         failed_ids.append(uid)
             out_f.flush()
 
-            # Write failed IDs to retry file so they are not silently skipped.
+            # Write failed IDs to retry file as CSV so the file can be passed
+            # back as --input to read_user_ids (which expects a CSV header).
             if failed_ids:
-                with args.retry_out.open("a") as retry_f:
+                write_header = not args.retry_out.exists() or args.retry_out.stat().st_size == 0
+                with args.retry_out.open("a", newline="") as retry_f:
+                    retry_writer = csv.DictWriter(retry_f, fieldnames=["user_id", "is_active"])
+                    if write_header:
+                        retry_writer.writeheader()
                     for uid in failed_ids:
-                        retry_f.write(uid + "\n")
+                        retry_writer.writerow({"user_id": uid, "is_active": "true"})
                 print(
                     f"  {len(failed_ids)} failed user_id(s) written to {args.retry_out}",
                     flush=True,
