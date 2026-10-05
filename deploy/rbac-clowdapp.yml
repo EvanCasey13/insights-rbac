@@ -2189,7 +2189,7 @@ parameters:
   value: '50'
 - name: MIN_POSTGRES_EXPORTER_REPLICAS
   description: Minimum replicas for postgres-exporter
-  value: '0'
+  value: '1'
 - name: POSTGRES_EXPORTER_IMAGE
   description: Postgres exporter image
   value: quay.io/prometheuscommunity/postgres-exporter:v0.19.1
