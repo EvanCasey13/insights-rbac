@@ -25,9 +25,23 @@ ROOT = Path(__file__).resolve().parents[4]
 CONFIG_ENV = ROOT / ".cursor/skills/config.env"
 INTERNAL_API_SH = Path(__file__).resolve().parent / "internal-api.sh"
 DEFAULT_INPUT = ROOT / "empty_user_id_bop_user_ids_prod.csv"
-DEFAULT_RESULTS = ROOT / "empty_user_id_bootstrap_results_prod.csv"
-DEFAULT_PROGRESS = ROOT / "empty_user_id_bootstrap_progress.json"
-DEFAULT_RETRY = ROOT / "empty_user_id_bootstrap_retry_prod.txt"
+
+# Defaults are resolved after arg parsing so they can incorporate --env and --dry-run;
+# see _resolve_output_defaults().  These constants are only used as argparse sentinels.
+_SENTINEL_RESULTS = None
+_SENTINEL_PROGRESS = None
+_SENTINEL_RETRY = None
+
+
+def _resolve_output_defaults(args: argparse.Namespace) -> None:
+    """Fill in env/mode-aware default paths for any output arg the user did not override."""
+    dry_tag = "_dry" if args.dry_run else ""
+    if args.results_out is None:
+        args.results_out = ROOT / f"empty_user_id_bootstrap_results_{args.env}{dry_tag}.csv"
+    if args.progress is None:
+        args.progress = ROOT / f"empty_user_id_bootstrap_progress_{args.env}.json"
+    if args.retry_out is None:
+        args.retry_out = ROOT / f"empty_user_id_bootstrap_retry_{args.env}{dry_tag}.txt"
 
 
 def load_config_env(path: Path) -> dict[str, str]:
@@ -162,9 +176,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env", choices=("stage", "prod"), default="prod")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
-    parser.add_argument("--results-out", type=Path, default=DEFAULT_RESULTS)
-    parser.add_argument("--retry-out", type=Path, default=DEFAULT_RETRY)
-    parser.add_argument("--progress", type=Path, default=DEFAULT_PROGRESS)
+    parser.add_argument("--results-out", type=Path, default=_SENTINEL_RESULTS)
+    parser.add_argument("--retry-out", type=Path, default=_SENTINEL_RETRY)
+    parser.add_argument("--progress", type=Path, default=_SENTINEL_PROGRESS)
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--sleep", type=float, default=1.0, help="Seconds to pause between batches")
     parser.add_argument("--max-batches", type=int, default=0, help="0 = no limit")
@@ -177,6 +191,7 @@ def main() -> int:
         help="Only bootstrap rows with is_active=True (default: true)",
     )
     args = parser.parse_args()
+    _resolve_output_defaults(args)
 
     cfg = load_config_env(CONFIG_ENV)
     session = os.environ.get("SESSION") or cfg.get("SESSION")
@@ -190,20 +205,19 @@ def main() -> int:
 
     user_ids = read_user_ids(args.input, active_only=args.active_only)
     fingerprint = compute_progress_fingerprint(args.env, args.input, args.active_only)
-    start = 0 if args.reset else read_progress(args.progress, fingerprint)
+    # Dry runs never resume from a live checkpoint — always start from offset 0.
+    start = 0 if (args.reset or args.dry_run) else read_progress(args.progress, fingerprint)
     if start > len(user_ids):
         start = len(user_ids)
 
     mode = "w" if args.reset or start == 0 else "a"
-    if args.reset or start == 0:
-        for path in (args.results_out, args.progress):
+    # Only delete output files on explicit --reset and never during a dry run.
+    # mode="w" already truncates on first write, so deletion at start==0 is
+    # unnecessary and previously caused cross-env/cross-mode data loss.
+    if args.reset and not args.dry_run:
+        for path in (args.results_out, args.progress, args.retry_out):
             if path.exists():
                 path.unlink()
-    # Only delete the retry file on explicit --reset; a new run with a different
-    # fingerprint (start == 0) must not destroy a retry file left by another run.
-    if args.reset:
-        if args.retry_out.exists():
-            args.retry_out.unlink()
 
     print(
         f"Loaded {len(user_ids)} user_ids (active_only={args.active_only}); "
