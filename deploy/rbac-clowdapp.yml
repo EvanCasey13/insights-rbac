@@ -1003,6 +1003,7 @@ objects:
         image: ${POSTGRES_EXPORTER_IMAGE}
         args:
         - "--extend.query-path=/etc/config.yaml"
+        - "--config.file="
         env:
         - name: DATABASE_HOST
           valueFrom:
@@ -1659,7 +1660,7 @@ objects:
       port: 9187
       targetPort: 9187
     selector:
-      pod: rbac-postgres-exporter
+      pod: rbac-rbac-postgres-exporter
     type: ClusterIP
 parameters:
 - description: Image name
