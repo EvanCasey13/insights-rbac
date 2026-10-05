@@ -34,6 +34,7 @@ CONFIG_ENV = ROOT / ".cursor/skills/config.env"
 
 
 def load_config_env(path: Path) -> dict[str, str]:
+    """Load key=value pairs from a config.env file, ignoring comments and blanks."""
     values: dict[str, str] = {}
     if not path.exists():
         return values
@@ -47,6 +48,7 @@ def load_config_env(path: Path) -> dict[str, str]:
 
 
 def build_opener(proxy: str | None, *, insecure: bool):
+    """Build a urllib opener with optional proxy and TLS verification settings."""
     handlers: list = []
     if proxy:
         handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
@@ -66,6 +68,7 @@ def query_bop(
     *,
     timeout: float,
 ) -> list[dict]:
+    """Query the BOP /v1/users endpoint for the given usernames and return user records."""
     url = (
         f"https://{host}/v1/users"
         "?include_permissions=false"
@@ -100,6 +103,7 @@ def query_bop(
 
 
 def read_usernames(path: Path) -> list[str]:
+    """Read non-empty usernames from a text file, one per line."""
     names: list[str] = []
     with path.open() as f:
         for line in f:
@@ -110,6 +114,7 @@ def read_usernames(path: Path) -> list[str]:
 
 
 def read_progress(path: Path) -> int:
+    """Read the saved batch offset from a progress file, returning 0 if absent."""
     if not path.exists():
         return 0
     text = path.read_text().strip()
@@ -117,10 +122,12 @@ def read_progress(path: Path) -> int:
 
 
 def write_progress(path: Path, offset: int) -> None:
+    """Persist the current batch offset to the progress file."""
     path.write_text(str(offset))
 
 
 def main() -> int:
+    """Look up BOP user IDs for usernames with empty RBAC user_id in batches."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--found-out", type=Path, default=DEFAULT_FOUND)

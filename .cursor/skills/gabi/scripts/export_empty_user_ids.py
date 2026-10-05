@@ -15,6 +15,7 @@ BATCH = 5000
 
 
 def run_gabi(sql: str) -> dict:
+    """Execute a SQL query via gabi.sh and return the parsed JSON result."""
     result = subprocess.run(
         ["sh", str(ROOT / ".cursor/skills/gabi/scripts/gabi.sh"), "prod", sql],
         capture_output=True,
@@ -23,6 +24,10 @@ def run_gabi(sql: str) -> dict:
         env=os.environ.copy(),
     )
     out = result.stdout
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"gabi.sh failed rc={result.returncode} stderr={result.stderr[-800:]!r} stdout={out[:500]!r}"
+        )
     start = out.find("{")
     if start < 0:
         raise RuntimeError(f"No JSON from gabi. stderr={result.stderr[-800:]!r} stdout={out[:500]!r}")
@@ -33,6 +38,7 @@ def run_gabi(sql: str) -> dict:
 
 
 def main() -> int:
+    """Export usernames of principals with empty user_id to a text file."""
     if not os.environ.get("TOKEN"):
         print("TOKEN is not set", file=sys.stderr)
         return 1

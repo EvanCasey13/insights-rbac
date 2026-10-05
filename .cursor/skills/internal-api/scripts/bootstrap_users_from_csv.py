@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import re
@@ -25,10 +26,12 @@ CONFIG_ENV = ROOT / ".cursor/skills/config.env"
 INTERNAL_API_SH = Path(__file__).resolve().parent / "internal-api.sh"
 DEFAULT_INPUT = ROOT / "empty_user_id_bop_user_ids_prod.csv"
 DEFAULT_RESULTS = ROOT / "empty_user_id_bootstrap_results_prod.csv"
-DEFAULT_PROGRESS = ROOT / "empty_user_id_bootstrap_progress.txt"
+DEFAULT_PROGRESS = ROOT / "empty_user_id_bootstrap_progress.json"
+DEFAULT_RETRY = ROOT / "empty_user_id_bootstrap_retry_prod.txt"
 
 
 def load_config_env(path: Path) -> dict[str, str]:
+    """Load key=value pairs from a config.env file, ignoring comments and blanks."""
     values: dict[str, str] = {}
     if not path.exists():
         return values
@@ -42,6 +45,7 @@ def load_config_env(path: Path) -> dict[str, str]:
 
 
 def read_user_ids(path: Path, *, active_only: bool) -> list[str]:
+    """Read deduplicated user IDs from a CSV file, optionally filtering to active rows."""
     user_ids: list[str] = []
     seen: set[str] = set()
     with path.open() as f:
@@ -57,15 +61,31 @@ def read_user_ids(path: Path, *, active_only: bool) -> list[str]:
     return user_ids
 
 
-def read_progress(path: Path) -> int:
+def compute_progress_fingerprint(env: str, input_path: Path, active_only: bool) -> str:
+    """Compute a fingerprint tying progress to the current run parameters."""
+    key = f"{env}|{input_path.resolve()}|{active_only}"
+    return hashlib.md5(key.encode()).hexdigest()[:12]
+
+
+def read_progress(path: Path, fingerprint: str) -> int:
+    """Read the saved batch offset, returning 0 if absent or fingerprint mismatches."""
     if not path.exists():
         return 0
     text = path.read_text().strip()
-    return int(text) if text else 0
+    if not text:
+        return 0
+    try:
+        data = json.loads(text)
+        if data.get("fingerprint") != fingerprint:
+            return 0
+        return int(data.get("offset", 0))
+    except (json.JSONDecodeError, ValueError):
+        return 0
 
 
-def write_progress(path: Path, offset: int) -> None:
-    path.write_text(str(offset))
+def write_progress(path: Path, offset: int, fingerprint: str) -> None:
+    """Persist the current batch offset with a fingerprint for run-parameter validation."""
+    path.write_text(json.dumps({"offset": offset, "fingerprint": fingerprint}))
 
 
 def bootstrap_batch(
@@ -138,10 +158,12 @@ def bootstrap_batch(
 
 
 def main() -> int:
+    """Parse arguments, process user IDs in batches, and write results to CSV."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env", choices=("stage", "prod"), default="prod")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--results-out", type=Path, default=DEFAULT_RESULTS)
+    parser.add_argument("--retry-out", type=Path, default=DEFAULT_RETRY)
     parser.add_argument("--progress", type=Path, default=DEFAULT_PROGRESS)
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--sleep", type=float, default=1.0, help="Seconds to pause between batches")
@@ -167,13 +189,14 @@ def main() -> int:
         return 1
 
     user_ids = read_user_ids(args.input, active_only=args.active_only)
-    start = 0 if args.reset else read_progress(args.progress)
+    fingerprint = compute_progress_fingerprint(args.env, args.input, args.active_only)
+    start = 0 if args.reset else read_progress(args.progress, fingerprint)
     if start > len(user_ids):
         start = len(user_ids)
 
     mode = "w" if args.reset or start == 0 else "a"
     if args.reset or start == 0:
-        for path in (args.results_out, args.progress):
+        for path in (args.results_out, args.progress, args.retry_out):
             if path.exists():
                 path.unlink()
 
@@ -248,10 +271,12 @@ def main() -> int:
                     payload = {"results": results}
                 else:
                     print(f"Error at offset {offset}: {err}", file=sys.stderr)
-                    write_progress(args.progress, offset)
+                    if not args.dry_run:
+                        write_progress(args.progress, offset, fingerprint)
                     return 1
 
             results = payload.get("results", [])
+            failed_ids: list[str] = []
             for item in results:
                 status = item.get("status", "unknown")
                 status_counts[status] = status_counts.get(status, 0) + 1
@@ -266,11 +291,27 @@ def main() -> int:
                         "is_org_admin": item.get("is_org_admin", ""),
                     }
                 )
+                if status == "error":
+                    uid = item.get("user_id", "")
+                    if uid:
+                        failed_ids.append(uid)
             out_f.flush()
+
+            # Write failed IDs to retry file so they are not silently skipped.
+            if failed_ids:
+                with args.retry_out.open("a") as retry_f:
+                    for uid in failed_ids:
+                        retry_f.write(uid + "\n")
+                print(
+                    f"  {len(failed_ids)} failed user_id(s) written to {args.retry_out}",
+                    flush=True,
+                )
 
             offset += len(batch)
             batches += 1
-            write_progress(args.progress, offset)
+            # Do not advance the live checkpoint during dry runs.
+            if not args.dry_run:
+                write_progress(args.progress, offset, fingerprint)
 
             print(
                 f"[batch {batch_num}] done -> offset={offset}/{len(user_ids)} "
@@ -283,10 +324,11 @@ def main() -> int:
                 time.sleep(args.sleep)
 
     print(
-        f"DONE offset={offset}/{len(user_ids)} status_counts={status_counts}\n"
-        f"results -> {args.results_out}",
+        f"DONE offset={offset}/{len(user_ids)} status_counts={status_counts}\n" f"results -> {args.results_out}",
         flush=True,
     )
+    if args.retry_out.exists():
+        print(f"retry  -> {args.retry_out}", flush=True)
     return 0
 
 

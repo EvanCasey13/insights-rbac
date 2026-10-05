@@ -16,4 +16,4 @@ if [ -n "${PROXY:-}" ]; then
 fi
 
 cd "$ROOT"
-exec python3 "${SCRIPT_DIR}/lookup_bop_user_ids.py" --insecure "$@"
+exec python3 "${SCRIPT_DIR}/lookup_bop_user_ids.py" "$@"
