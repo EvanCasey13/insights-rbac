@@ -220,6 +220,14 @@ class UtilsTests(IdentityRequest):
         request.tenant = self.tenant
         request.user.user_id = "1234567890"
 
+        # Provide a realistic BOP response so the return value is used correctly when creating principals.
+        verify_principal_with_proxy.return_value = {
+            "status_code": 200,
+            "data": [
+                {"username": "clearly-not-another-service-account", "user_id": "9876543210", "is_org_admin": False}
+            ],
+        }
+
         # Call the function under test with the database principal's username and the "from_query" flag as "True", so
         # that we execute the "verify_principal_with_proxy" function from the "try" block, and not the "except" one.
         fetched_result = get_principal(username=database_principal.username, request=request, from_query=True)
@@ -251,6 +259,9 @@ class UtilsTests(IdentityRequest):
             "this flags that the specified username is from the database principal created in the test, but in"
             "this case we were expecting a new principal to be created",
         )
+
+        # Verify that the created principal has the user_id from the BOP response.
+        self.assertEqual(created_result.user_id, "9876543210")
 
     def test_get_principal_service_account_created(self):
         """Test that when a service account principal does not exist in the database, it gets created."""
@@ -389,6 +400,28 @@ class UtilsTests(IdentityRequest):
         # Assert that the service account was properly created in the database.
         self.assertEqual(principal.username, username)
 
+    def test_get_principal_from_request_created(self):
+        """Test that when a principal does not exist in the database, it gets created with user_id from identity."""
+        username = "abcde"
+
+        request = mock.Mock()
+        request.tenant = self.tenant
+        request.user = User()
+        request.user.username = username
+        request.user.user_id = "52567473"
+        request.query_params = {}
+
+        # Attempt to fetch the principal from the database. Since it does not exist, it should create one.
+        # When called without a username query param, verify_principal=False so BOP is not called;
+        # user_id falls back to the identity header (request.user.user_id).
+        get_principal_from_request(request=request)
+
+        # Assert that the principal was properly created in the database with the identity header user_id.
+        created_principal = Principal.objects.get(username=username)
+        self.assertEqual(created_principal.type, "user")
+        self.assertEqual(created_principal.username, username)
+        self.assertEqual(created_principal.user_id, "52567473")
+
     @mock.patch(
         "management.principal.proxy.PrincipalProxy.request_filtered_principals",
         return_value={
@@ -406,17 +439,19 @@ class UtilsTests(IdentityRequest):
             ],
         },
     )
-    def test_get_principal_from_request_created(self, mock_request_principals):
-        """Test that when a principal does not exist in the database, it gets created with user_id."""
+    def test_get_principal_from_request_created_from_query(self, mock_request_principals):
+        """Test that when a principal is looked up via query param, BOP is called with return_id and user_id is set."""
         username = "abcde"
 
         request = mock.Mock()
         request.tenant = self.tenant
         request.user = User()
-        request.user.username = username
-        request.query_params = {}
+        request.user.username = "other_user"
+        request.user.org_id = self.tenant.org_id
+        request.user.admin = True
+        request.query_params = {"username": username}
 
-        # Attempt to fetch the principal from the database. Since it does not exist, it should create one.
+        # Attempt to fetch the principal from the database via username query param.
         get_principal_from_request(request=request)
 
         # Assert that the principal was properly created in the database with BOP user_id.

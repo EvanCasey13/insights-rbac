@@ -384,6 +384,9 @@ def get_principal(
         else:
             # Avoid possible race condition if the user was created while checking BOP
             user_id = bop_resp["data"][0].get("user_id") if bop_resp and bop_resp.get("data") else None
+            # Fall back to user_id from the identity header when BOP was not called.
+            if not user_id:
+                user_id = getattr(request.user, "user_id", None)
             defaults = {"user_id": str(user_id)} if user_id else {}
             principal, _ = Principal.objects.get_or_create(username=username, tenant=tenant, defaults=defaults)
             PRINCIPAL_CACHE.cache_principal(org_id=tenant.org_id, principal=principal)
