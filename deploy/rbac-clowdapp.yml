@@ -1024,7 +1024,7 @@ objects:
               name: db-clone
               optional: false
         - name: DATA_SOURCE_URI
-          value: "$(DATABASE_HOST):$(DATABASE_PORT)/$(DATABASE_NAME)?sslmode=require"
+          value: "$(DATABASE_HOST):$(DATABASE_PORT)/$(DATABASE_NAME)?sslmode=${POSTGRES_EXPORTER_SSLMODE}"
         - name: DATA_SOURCE_USER
           valueFrom:
             secretKeyRef:
@@ -1751,6 +1751,10 @@ parameters:
   displayName: Postgres SSL mode
   name: PGSSLMODE
   value: prefer
+- description: 'SSL mode for the postgres-exporter DSN (lib/pq only supports disable, require, verify-ca, verify-full -- not "prefer")'
+  displayName: Postgres exporter SSL mode
+  name: POSTGRES_EXPORTER_SSLMODE
+  value: require
 - description: Python boolean value to enable/disable permission seeding on app boot
   name: PERMISSION_SEEDING_ENABLED
   required: true
