@@ -194,7 +194,10 @@ class UtilsTests(IdentityRequest):
         request.query_params = {}
 
         # Attempt to fetch the principal from the database. Since it does not exist, it should create one.
-        get_principal(username=user.username, request=request)
+        returned_principal = get_principal(username=user.username, request=request)
+
+        # Assert that the returned principal has the correct user_id.
+        self.assertEqual(returned_principal.user_id, "5840588")
 
         # Assert that the principal was properly created in the database with the BOP user_id.
         created_principal = Principal.objects.get(username=user.username)
