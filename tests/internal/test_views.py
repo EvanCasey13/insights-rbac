@@ -5980,11 +5980,13 @@ class InternalBootstrapUsersFromUserIdsTests(BaseInternalViewsetTests):
             content_type="application/json",
         )
 
-    def _bop_user(self, user_id, username, org_id=None, is_active=True, is_org_admin=False):
+    _UNSET = object()
+
+    def _bop_user(self, user_id, username, org_id=_UNSET, is_active=True, is_org_admin=False):
         return {
             "user_id": user_id,
             "username": username,
-            "org_id": org_id if org_id is not None else self.tenant.org_id,
+            "org_id": self.tenant.org_id if org_id is self._UNSET else org_id,
             "is_active": is_active,
             "is_org_admin": is_org_admin,
         }
