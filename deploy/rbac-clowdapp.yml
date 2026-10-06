@@ -1024,7 +1024,7 @@ objects:
               name: db-clone
               optional: false
         - name: DATA_SOURCE_URI
-          value: "$(DATABASE_HOST):$(DATABASE_PORT)/$(DATABASE_NAME)?sslmode=${PGSSLMODE}"
+          value: "$(DATABASE_HOST):$(DATABASE_PORT)/$(DATABASE_NAME)?sslmode=require"
         - name: DATA_SOURCE_USER
           valueFrom:
             secretKeyRef:
