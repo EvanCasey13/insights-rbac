@@ -350,11 +350,14 @@ def get_principal(
     # First check if principal exist on our side, if not call BOP to check if user exist in the account.
     tenant: Tenant = request.tenant if not user_tenant else user_tenant
     is_username_service_account = ITService.is_username_service_account(username)
+    bop_resp = None
 
     try:
         # If the username was provided through a query we must verify if it exists in the corresponding services first.
         if from_query and not is_username_service_account:
-            verify_principal_with_proxy(username=username, request=request, verify_principal=verify_principal)
+            bop_resp = verify_principal_with_proxy(
+                username=username, request=request, verify_principal=verify_principal
+            )
 
         principal = PRINCIPAL_CACHE.get_principal(tenant.org_id, username)
         if not principal:
@@ -365,7 +368,9 @@ def get_principal(
         # If the "from query" parameter was specified, the username was validated above, so there is no need to
         # validate it again.
         if not from_query and not is_username_service_account:
-            verify_principal_with_proxy(username=username, request=request, verify_principal=verify_principal)
+            bop_resp = verify_principal_with_proxy(
+                username=username, request=request, verify_principal=verify_principal
+            )
 
         if is_username_service_account:
             client_id: uuid.UUID = ITService.extract_client_id_service_account_username(username)
@@ -378,7 +383,14 @@ def get_principal(
             )
         else:
             # Avoid possible race condition if the user was created while checking BOP
-            principal, _ = Principal.objects.get_or_create(username=username, tenant=tenant)
+            user_id = bop_resp["data"][0].get("user_id") if bop_resp and bop_resp.get("data") else None
+            # Fall back to user_id from the identity header only when the queried
+            # username matches the requesting user.  When a different user is being
+            # looked up we must not assign the requester's ID to someone else's principal.
+            if not user_id and username == request.user.username:
+                user_id = getattr(request.user, "user_id", None)
+            defaults = {"user_id": str(user_id)} if user_id else {}
+            principal, _ = Principal.objects.get_or_create(username=username, tenant=tenant, defaults=defaults)
             PRINCIPAL_CACHE.cache_principal(org_id=tenant.org_id, principal=principal)
 
     return principal
@@ -389,7 +401,9 @@ def verify_principal_with_proxy(username, request, verify_principal=True):
     if verify_principal:
         org_id = request.user.org_id
         proxy = PrincipalProxy()
-        resp = proxy.request_filtered_principals([username], org_id=org_id, options=request.query_params)
+        options = dict(request.query_params)
+        options["return_id"] = True
+        resp = proxy.request_filtered_principals([username], org_id=org_id, options=options)
 
         if isinstance(resp, dict) and "errors" in resp:
             raise Exception("Dependency error: request to get users from dependent service failed.")
