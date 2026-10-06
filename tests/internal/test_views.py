@@ -6047,11 +6047,17 @@ class InternalBootstrapUsersFromUserIdsTests(BaseInternalViewsetTests):
     @patch("management.relation_replicator.outbox_replicator.OutboxReplicator.replicate")
     @patch("management.principal.proxy.PrincipalProxy.request_filtered_principals")
     def test_merges_duplicate_principal_on_username_change(self, request_filtered_principals, replicate):
-        """A BOP username change leaves an obsolete principal (has user_id) and a survivor (no user_id).
+        """Merge when a BOP username change creates a stale principal.
 
-        The endpoint should merge them: group memberships move to the survivor, the survivor is
-        assigned the user_id, the obsolete principal is deleted, and SpiceDB group-member tuples
-        are replicated for the survivor.
+        Setup creates only the obsolete principal (has user_id, old username).
+        The bootstrap flow creates the survivor (current BOP username) via
+        _ensure_principal_with_user_id_in_tenant / get_or_create, then merges
+        the obsolete row into it — transferring group memberships, assigning
+        the user_id, deleting the obsolete principal, and replicating SpiceDB
+        group-member tuples for the survivor.
+
+        The dual-row pre-existing scenario is covered in
+        tests.management.tenant_service.test_merge_principal.
         """
         tuples = InMemoryTuples()
         replicate.side_effect = InMemoryRelationReplicator(tuples).replicate
