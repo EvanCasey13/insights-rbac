@@ -5962,6 +5962,193 @@ class InternalOptInViewsetTests(BaseInternalViewsetTests):
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
 
+class InternalBootstrapUsersFromUserIdsTests(BaseInternalViewsetTests):
+    """Tests for the bootstrap_users_from_user_ids internal endpoint."""
+
+    url = "/_private/api/utils/bootstrap_users_from_user_ids/"
+
+    def setUp(self):
+        super().setUp()
+        bootstrap_tenant_for_v2_test(self.tenant)
+
+    def _post(self, user_ids, dry_run=False):
+        url = self.url + ("?dry_run=true" if dry_run else "")
+        return self.client.post(
+            url,
+            data=json.dumps({"user_ids": user_ids}),
+            **self.request.META,
+            content_type="application/json",
+        )
+
+    def _bop_user(self, user_id, username, org_id=None, is_active=True, is_org_admin=False):
+        return {
+            "user_id": user_id,
+            "username": username,
+            "org_id": org_id if org_id is not None else self.tenant.org_id,
+            "is_active": is_active,
+            "is_org_admin": is_org_admin,
+        }
+
+    def _result_for(self, response, user_id):
+        body = json.loads(response.content)
+        return next(r for r in body["results"] if r["user_id"] == user_id)
+
+    @patch("management.principal.proxy.PrincipalProxy.request_filtered_principals")
+    def test_dry_run_would_bootstrap_new_user(self, request_filtered_principals):
+        request_filtered_principals.return_value = {
+            "status_code": 200,
+            "data": [self._bop_user("111222", "new.user@redhat.com")],
+        }
+
+        response = self._post(["111222"], dry_run=True)
+
+        self.assertEqual(response.status_code, 200)
+        result = self._result_for(response, "111222")
+        self.assertEqual(result["status"], "would_bootstrap")
+        self.assertFalse(Principal.objects.filter(tenant=self.tenant, user_id="111222").exists())
+
+    @patch("management.principal.proxy.PrincipalProxy.request_filtered_principals")
+    def test_dry_run_would_merge_duplicate_principal(self, request_filtered_principals):
+        obsolete = Principal.objects.create(username="old.user@redhat.com", tenant=self.tenant, user_id="111222")
+        request_filtered_principals.return_value = {
+            "status_code": 200,
+            "data": [self._bop_user("111222", "new.user@redhat.com")],
+        }
+
+        response = self._post(["111222"], dry_run=True)
+
+        self.assertEqual(response.status_code, 200)
+        result = self._result_for(response, "111222")
+        self.assertEqual(result["status"], "would_merge")
+        self.assertIn("old.user@redhat.com", result["detail"])
+        # dry_run must not mutate anything
+        self.assertTrue(Principal.objects.filter(pk=obsolete.pk).exists())
+
+    @patch("management.relation_replicator.outbox_replicator.OutboxReplicator.replicate")
+    @patch("management.principal.proxy.PrincipalProxy.request_filtered_principals")
+    def test_bootstraps_new_user(self, request_filtered_principals, replicate):
+        tuples = InMemoryTuples()
+        replicate.side_effect = InMemoryRelationReplicator(tuples).replicate
+        request_filtered_principals.return_value = {
+            "status_code": 200,
+            "data": [self._bop_user("111222", "new.user@redhat.com")],
+        }
+
+        response = self._post(["111222"])
+
+        self.assertEqual(response.status_code, 200)
+        result = self._result_for(response, "111222")
+        self.assertEqual(result["status"], "bootstrapped")
+        principal = Principal.objects.get(tenant=self.tenant, user_id="111222")
+        self.assertEqual(principal.username, "new.user@redhat.com")
+
+    @patch("management.relation_replicator.outbox_replicator.OutboxReplicator.replicate")
+    @patch("management.principal.proxy.PrincipalProxy.request_filtered_principals")
+    def test_merges_duplicate_principal_on_username_change(self, request_filtered_principals, replicate):
+        """A BOP username change leaves an obsolete principal (has user_id) and a survivor (no user_id).
+
+        The endpoint should merge them: group memberships move to the survivor, the survivor is
+        assigned the user_id, the obsolete principal is deleted, and SpiceDB group-member tuples
+        are replicated for the survivor.
+        """
+        tuples = InMemoryTuples()
+        replicate.side_effect = InMemoryRelationReplicator(tuples).replicate
+
+        obsolete = Principal.objects.create(username="old.user@redhat.com", tenant=self.tenant, user_id="54181241")
+        group = Group.objects.create(name="engineering", tenant=self.tenant)
+        group.principals.add(obsolete)
+
+        request_filtered_principals.return_value = {
+            "status_code": 200,
+            "data": [self._bop_user("54181241", "new.user@redhat.com")],
+        }
+
+        response = self._post(["54181241"])
+
+        self.assertEqual(response.status_code, 200)
+        result = self._result_for(response, "54181241")
+        self.assertEqual(result["status"], "merged")
+        self.assertEqual(result["username"], "new.user@redhat.com")
+
+        # Obsolete principal is gone; exactly one principal now owns the user_id.
+        self.assertFalse(Principal.objects.filter(pk=obsolete.pk).exists())
+        survivor = Principal.objects.get(tenant=self.tenant, user_id="54181241")
+        self.assertEqual(survivor.username, "new.user@redhat.com")
+
+        # Group membership moved from the obsolete principal to the survivor.
+        self.assertEqual(list(group.principals.all()), [survivor])
+
+        # SpiceDB group-member tuple replicated for the survivor.
+        self.assertEqual(
+            tuples.count_tuples(
+                all_of(
+                    resource("rbac", "group", str(group.uuid)),
+                    relation("member"),
+                    subject("rbac", "principal", "redhat/54181241"),
+                )
+            ),
+            1,
+        )
+
+    @patch("management.principal.proxy.PrincipalProxy.request_filtered_principals")
+    def test_user_not_found_in_bop_is_skipped(self, request_filtered_principals):
+        request_filtered_principals.return_value = {"status_code": 200, "data": []}
+
+        response = self._post(["999999"])
+
+        self.assertEqual(response.status_code, 200)
+        result = self._result_for(response, "999999")
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["detail"], "User not found in BOP")
+
+    @patch("management.principal.proxy.PrincipalProxy.request_filtered_principals")
+    def test_inactive_user_is_skipped(self, request_filtered_principals):
+        request_filtered_principals.return_value = {
+            "status_code": 200,
+            "data": [self._bop_user("111222", "inactive.user@redhat.com", is_active=False)],
+        }
+
+        response = self._post(["111222"])
+
+        self.assertEqual(response.status_code, 200)
+        result = self._result_for(response, "111222")
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["detail"], "User is not active in BOP")
+        self.assertFalse(Principal.objects.filter(tenant=self.tenant, user_id="111222").exists())
+
+    @patch("management.principal.proxy.PrincipalProxy.request_filtered_principals")
+    def test_user_missing_org_id_is_error(self, request_filtered_principals):
+        request_filtered_principals.return_value = {
+            "status_code": 200,
+            "data": [self._bop_user("111222", "no.org@redhat.com", org_id=None)],
+        }
+
+        response = self._post(["111222"])
+
+        self.assertEqual(response.status_code, 200)
+        result = self._result_for(response, "111222")
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["detail"], "User has no org_id in BOP")
+
+    @patch("management.principal.proxy.PrincipalProxy.request_filtered_principals")
+    def test_bop_error_returns_500(self, request_filtered_principals):
+        request_filtered_principals.return_value = {"status_code": 500, "errors": ["boom"]}
+
+        response = self._post(["111222"])
+
+        self.assertEqual(response.status_code, 500)
+
+    def test_invalid_body_returns_400(self):
+        response = self.client.post(
+            self.url, data=json.dumps({}), **self.request.META, content_type="application/json"
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_invalid_method_returns_405(self):
+        response = self.client.get(self.url, **self.request.META)
+        self.assertEqual(response.status_code, 405)
+
+
 @override_settings(KAFKA_ENABLED=True, RBAC_KAFKA_CONSUMER_TOPIC="test-topic")
 class SendKafkaTestMessageTests(IdentityRequest):
     """Tests for the send_kafka_test_message internal endpoint."""
