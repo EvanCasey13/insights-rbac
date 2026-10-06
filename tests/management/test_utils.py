@@ -414,7 +414,11 @@ class UtilsTests(IdentityRequest):
         # Attempt to fetch the principal from the database. Since it does not exist, it should create one.
         # When called without a username query param, verify_principal=False so BOP is not called;
         # user_id falls back to the identity header (request.user.user_id).
-        get_principal_from_request(request=request)
+        principal = get_principal_from_request(request=request)
+
+        # Assert that the returned principal has the correct username and user_id.
+        self.assertEqual(principal.username, username)
+        self.assertEqual(principal.user_id, "52567473")
 
         # Assert that the principal was properly created in the database with the identity header user_id.
         created_principal = Principal.objects.get(username=username)
@@ -452,7 +456,11 @@ class UtilsTests(IdentityRequest):
         request.query_params = {"username": username}
 
         # Attempt to fetch the principal from the database via username query param.
-        get_principal_from_request(request=request)
+        principal = get_principal_from_request(request=request)
+
+        # Assert that the returned principal has the correct username and user_id.
+        self.assertEqual(principal.username, username)
+        self.assertEqual(principal.user_id, "52567473")
 
         # Assert that the principal was properly created in the database with BOP user_id.
         created_principal = Principal.objects.get(username=username)
@@ -461,6 +469,44 @@ class UtilsTests(IdentityRequest):
         self.assertEqual(created_principal.user_id, "52567473")
         mock_request_principals.assert_called_once()
         self.assertTrue(mock_request_principals.call_args.kwargs.get("options", {}).get("return_id"))
+
+    @mock.patch(
+        "management.principal.proxy.PrincipalProxy.request_filtered_principals",
+        return_value={
+            "status_code": 200,
+            "data": [
+                {
+                    "org_id": "100001",
+                    "is_org_admin": False,
+                    "is_internal": False,
+                    "username": "abcde",
+                    "account_number": "1111111",
+                    "is_active": True,
+                }
+            ],
+        },
+    )
+    def test_get_principal_from_request_no_cross_user_id_fallback(self, mock_request_principals):
+        """Test that user_id from identity header is NOT assigned to a different user's principal."""
+        username = "abcde"
+
+        request = mock.Mock()
+        request.tenant = self.tenant
+        request.user = User()
+        request.user.username = "other_user"
+        request.user.user_id = "99999999"
+        request.user.org_id = self.tenant.org_id
+        request.user.admin = True
+        request.query_params = {"username": username}
+
+        # BOP returns the user but without user_id; the fallback must NOT use the requester's user_id.
+        principal = get_principal_from_request(request=request)
+
+        self.assertEqual(principal.username, username)
+        self.assertIsNone(principal.user_id)
+
+        created_principal = Principal.objects.get(username=username)
+        self.assertIsNone(created_principal.user_id)
 
     @mock.patch(
         "management.principal.proxy.PrincipalProxy.request_filtered_principals",
